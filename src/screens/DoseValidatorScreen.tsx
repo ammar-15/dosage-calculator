@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Platform, ScrollView, View } from "react-native";
+import { Keyboard, Platform, ScrollView, View } from "react-native";
 import { Controller, useForm } from "react-hook-form";
 import {
   Button,
@@ -51,16 +51,6 @@ type FormValues = {
   lastDoseMg?: string;
   notes?: string;
 };
-
-function computeStatusOnly(
-  v: FormValues,
-  hasSelectedDrug: boolean,
-): GuardrailsResult["status"] {
-  if (!v.patientName?.trim()) return "BLOCK";
-  if (!v.drugName?.trim()) return "BLOCK";
-  if (!hasSelectedDrug) return "WARN";
-  return "OK";
-}
 
 function formatLastTaken(date: Date | null): string {
   if (!date) return "Select date/time";
@@ -134,7 +124,6 @@ export default function DoseValidatorScreen() {
   const searchRequestRef = useRef(0);
 
   const liveValues = watch();
-  const liveStatus = computeStatusOnly(liveValues, Boolean(selectedDrug));
 
   useEffect(() => {
     // AI must remain submit-only in perceived UX.
@@ -154,6 +143,12 @@ export default function DoseValidatorScreen() {
 
   useEffect(() => {
     const q = drugQuery.trim();
+
+    if (selectedDrug && q === (selectedDrug.brand_name ?? "").trim()) {
+      setShowSuggestions(false);
+      setIsSearching(false);
+      return;
+    }
 
     if (q.length < 2) {
       setSuggestions([]);
@@ -186,7 +181,7 @@ export default function DoseValidatorScreen() {
     }, 250);
 
     return () => clearTimeout(timer);
-  }, [drugQuery]);
+  }, [drugQuery, selectedDrug]);
 
   const onDateChange = (event: NativeDateTimePickerEvent, selected?: Date) => {
     setShowDatePicker(false);
@@ -230,6 +225,7 @@ export default function DoseValidatorScreen() {
     setShowSuggestions(false);
 
     setSelectedDrug(item);
+    Keyboard.dismiss();
   };
 
   const onSubmit = async (values: FormValues) => {
@@ -312,6 +308,7 @@ export default function DoseValidatorScreen() {
 
   return (
     <ScrollView
+      nestedScrollEnabled
       keyboardShouldPersistTaps="handled"
       contentContainerStyle={{
         paddingHorizontal: 16,
@@ -426,7 +423,7 @@ export default function DoseValidatorScreen() {
                     }
                   }}
                   onFocus={() => {
-                    if (drugQuery.trim().length >= 2) {
+                    if (!selectedDrug && drugQuery.trim().length >= 2) {
                       setShowSuggestions(true);
                     }
                   }}
@@ -557,44 +554,8 @@ export default function DoseValidatorScreen() {
       </Card>
 
       <Card style={glassCardStyle}>
-        <Card.Title title="Result (Rule Engine + AI)" />
+        <Card.Title title="Result" />
         <Card.Content style={{ gap: 10 }}>
-          <View
-            style={{
-              alignSelf: "flex-start",
-              paddingHorizontal: 14,
-              paddingVertical: 6,
-              borderRadius: 999,
-              backgroundColor:
-                liveStatus === "OK"
-                  ? "rgba(79,227,193,0.12)"
-                  : liveStatus === "BLOCK"
-                    ? "rgba(255,82,82,0.16)"
-                    : liveStatus === "STOP"
-                      ? "rgba(255,82,82,0.22)"
-                      : "rgba(255,179,71,0.14)",
-              borderWidth: 1,
-              borderColor:
-                liveStatus === "OK"
-                  ? "rgba(79,227,193,0.25)"
-                  : liveStatus === "BLOCK"
-                    ? "rgba(255,82,82,0.38)"
-                    : liveStatus === "STOP"
-                      ? "rgba(255,82,82,0.45)"
-                      : "rgba(255,179,71,0.35)",
-            }}
-          >
-            <Text style={{ color: theme.colors.primary, fontWeight: "700" }}>{liveStatus}</Text>
-          </View>
-
-          <Text style={{ color: "rgba(255,255,255,0.85)" }}>
-            {liveStatus === "BLOCK"
-              ? "Complete required fields."
-              : liveStatus === "WARN"
-                ? "Select a drug from suggestions."
-                : "Ready to validate and save."}
-          </Text>
-
           <Text style={{ color: "rgba(255,255,255,0.85)" }}>
             Suggested next dose: {result?.suggestedNextDoseMg ?? "-"} mg
           </Text>

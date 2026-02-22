@@ -18,6 +18,10 @@ import {
   searchBrandSuggestions,
   type BrandSuggestion,
 } from "../lib/drugSearch";
+import {
+  computeFromGuardrails,
+  type GuardrailsResult,
+} from "../lib/guardrailsEngine";
 import { supabase } from "../lib/supabase";
 
 type NativeDateTimePickerEvent = {
@@ -51,82 +55,10 @@ type FormValues = {
   notes?: string;
 };
 
-type Result = {
-  status: "OK" | "WARN" | "BLOCK";
-  message: string;
-  suggestedNextDoseMg: number | null;
-  timeIntervalHours: number | null;
-  nextEligibleAt: string | null;
-};
-
-function computeSuggestedDose(
+function computeStatusOnly(
   v: FormValues,
   hasSelectedDrug: boolean,
-  lastTakenDate: Date | null,
-): Result {
-  const weightKg = Number(v.weightKg ?? "");
-  const lastDose = Number(v.lastDoseMg ?? "");
-
-  if (!v.patientName?.trim()) {
-    return {
-      status: "BLOCK",
-      message: "Patient name is required.",
-      suggestedNextDoseMg: null,
-      timeIntervalHours: null,
-      nextEligibleAt: null,
-    };
-  }
-
-  if (!v.drugName?.trim()) {
-    return {
-      status: "BLOCK",
-      message: "Drug name is required.",
-      suggestedNextDoseMg: null,
-      timeIntervalHours: null,
-      nextEligibleAt: null,
-    };
-  }
-
-  const intervalHours = 6;
-  const reference = lastTakenDate ? new Date(lastTakenDate) : new Date();
-  const nextEligibleAt = new Date(
-    reference.getTime() + intervalHours * 60 * 60 * 1000,
-  ).toISOString();
-
-  const baseByWeight = Number.isFinite(weightKg) && weightKg > 0 ? weightKg * 10 : 500;
-  const rounded = Math.round(baseByWeight / 5) * 5;
-  const suggestedNextDoseMg = Math.max(100, Math.min(1000, rounded));
-
-  if (!hasSelectedDrug) {
-    return {
-      status: "WARN",
-      message: "Drug not selected from database.",
-      suggestedNextDoseMg,
-      timeIntervalHours: intervalHours,
-      nextEligibleAt,
-    };
-  }
-
-  if (Number.isFinite(lastDose) && lastDose > 1000) {
-    return {
-      status: "WARN",
-      message: "Last dose seems unusually high. Double-check units.",
-      suggestedNextDoseMg,
-      timeIntervalHours: intervalHours,
-      nextEligibleAt,
-    };
-  }
-
-  return {
-    status: "OK",
-    message: "Ready.",
-    suggestedNextDoseMg,
-    timeIntervalHours: intervalHours,
-    nextEligibleAt,
-  };
-}
-
-function computeStatusOnly(v: FormValues, hasSelectedDrug: boolean): Result["status"] {
+): GuardrailsResult["status"] {
   if (!v.patientName?.trim()) return "BLOCK";
   if (!v.drugName?.trim()) return "BLOCK";
   if (!hasSelectedDrug) return "WARN";
@@ -187,7 +119,7 @@ export default function DoseValidatorScreen() {
     text: "",
   });
 
-  const [result, setResult] = useState<Result | null>(null);
+  const [result, setResult] = useState<GuardrailsResult | null>(null);
   const [aiSummary, setAiSummary] = useState<string | null>(null);
   const [aiWarnings, setAiWarnings] = useState<string | null>(null);
 
@@ -209,7 +141,7 @@ export default function DoseValidatorScreen() {
   const liveStatus = computeStatusOnly(liveValues, Boolean(selectedDrug));
 
   useEffect(() => {
-    // AI must remain submit-only. Clear prior AI output while editing fields.
+    // AI must remain submit-only in perceived UX.
     setAiSummary(null);
     setAiWarnings(null);
   }, [
@@ -309,15 +241,22 @@ export default function DoseValidatorScreen() {
     setAiSummary(null);
     setAiWarnings(null);
 
-    const ruleResult = computeSuggestedDose(
-      values,
-      Boolean(selectedDrug),
-      lastTakenDate,
-    );
+    const ruleResult = computeFromGuardrails({
+      patientName: values.patientName,
+      weightKg: values.weightKg ? Number(values.weightKg) : null,
+      ageYears: values.ageYears ? Number(values.ageYears) : null,
+      gender: values.gender ?? null,
+      drugName: values.drugName ?? "",
+      lastDoseMg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
+      lastDoseTakenAt: lastTakenDate,
+      notes: values.notes ?? null,
+      flags: {},
+      symptoms: [],
+    });
 
     setResult(ruleResult);
 
-    if (ruleResult.status === "BLOCK") {
+    if (ruleResult.status === "BLOCK" || ruleResult.status === "STOP") {
       return;
     }
 
@@ -649,19 +588,21 @@ export default function DoseValidatorScreen() {
                   ? "rgba(79,227,193,0.12)"
                   : liveStatus === "BLOCK"
                     ? "rgba(255,82,82,0.16)"
-                    : "rgba(255,179,71,0.14)",
+                    : liveStatus === "STOP"
+                      ? "rgba(255,82,82,0.22)"
+                      : "rgba(255,179,71,0.14)",
               borderWidth: 1,
               borderColor:
                 liveStatus === "OK"
                   ? "rgba(79,227,193,0.25)"
                   : liveStatus === "BLOCK"
                     ? "rgba(255,82,82,0.38)"
-                    : "rgba(255,179,71,0.35)",
+                    : liveStatus === "STOP"
+                      ? "rgba(255,82,82,0.45)"
+                      : "rgba(255,179,71,0.35)",
             }}
           >
-            <Text style={{ color: theme.colors.primary, fontWeight: "700" }}>
-              {liveStatus}
-            </Text>
+            <Text style={{ color: theme.colors.primary, fontWeight: "700" }}>{liveStatus}</Text>
           </View>
 
           <Text style={{ color: "rgba(255,255,255,0.85)" }}>

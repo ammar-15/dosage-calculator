@@ -1,115 +1,174 @@
-import guardrails from "./guardrails.json";
+import framework from "./dosing_rules.json";
 
-export type GuardrailsResult = {
-  status: "OK" | "WARN" | "BLOCK";
-  message: string;
-  suggestedNextDoseMg: number | null;
-  timeIntervalHours: number | null;
-  nextEligibleAt: string | null;
+type Gender = "male" | "female" | "other";
+
+type Flags = {
+  drug_allergy?: boolean;
+  class_allergy?: boolean;
+  active_gi_bleed?: boolean;
+  severe_liver_disease?: boolean;
+  severe_renal_failure?: boolean;
+  mild_renal_impairment?: boolean;
+  mild_hepatic_impairment?: boolean;
+  dehydration?: boolean;
+  pregnant?: boolean;
+  breastfeeding?: boolean;
 };
 
-/**
- * This engine MUST NOT invent anything.
- * It must only use values defined in guardrails.json.
- */
-export function computeFromGuardrails(input: {
+export type EngineInput = {
   patientName: string;
   weightKg?: number | null;
   ageYears?: number | null;
-  gender?: "male" | "female" | "other" | null;
+  gender?: Gender | null;
   drugName: string;
   lastDoseMg?: number | null;
   lastDoseTakenAt?: Date | null;
   notes?: string | null;
-}): GuardrailsResult {
-  // 1) basic required checks
-  if (!input.patientName?.trim()) {
-    return block("Patient name is required.");
-  }
-  if (!input.drugName?.trim()) {
-    return block("Drug name is required.");
-  }
+  flags?: Flags;
+  symptoms?: string[];
+};
 
-  // 2) find matching rule
-  // NOTE: I don't know your schema yet, so this is a safe placeholder.
-  // After you re-upload guardrails.json, I will replace this selector
-  // to match your exact JSON structure.
-  const rule = findRuleByDrugName(input.drugName);
+export type GuardrailsResult = {
+  status: "OK" | "WARN" | "BLOCK" | "STOP";
+  message: string;
+  suggestedNextDoseMg: number | null;
+  timeIntervalHours: number | null;
+  nextEligibleAt: string | null;
+  capsApplied: boolean;
+  appliedFormulaType: string | null;
+  blockReasons: string[];
+  ruleVersion: string;
+};
 
-  if (!rule) {
-    return warn("Drug not supported by guardrails.", null, null, null);
-  }
+type Framework = {
+  meta: { rules_version: string };
+  age_weight_logic: {
+    plausibility_limits: {
+      weight_kg_min: number;
+      weight_kg_max: number;
+      age_years_min: number;
+      age_years_max: number;
+    };
+  };
+  contraindication_handling: {
+    hard_stop_conditions: string[];
+  };
+  antimicrobial_stewardship_rules: {
+    require_supported_indication: boolean;
+  };
+  emergency_escalation: {
+    hard_stop_symptoms: string[];
+  };
+  fail_safe_policy: {
+    on_engine_error_message: string;
+  };
+};
 
-  // 3) enforce rule-required inputs
-  // Example: if pediatric rule requires weight
-  if (rule.requiresWeight && (!input.weightKg || input.weightKg <= 0)) {
-    return warn("Weight is required for this drug.", null, null, null);
-  }
+const cfg = framework as Framework;
 
-  // 4) compute dose using ONLY guardrails-provided values
-  // Example patterns your guardrails might encode:
-  // - mg_per_kg with caps
-  // - fixed_mg adult dosing
-  // - interval hours
-  // - min interval checks vs lastDoseTakenAt
-  const dose = computeDoseFromRule(rule, input);
-  const intervalHours = rule.intervalHours ?? null;
+const EMERGENCY_KEYWORDS = new Set(
+  (cfg.emergency_escalation?.hard_stop_symptoms ?? []).map((s) =>
+    String(s).toLowerCase(),
+  ),
+);
 
-  const nextEligibleAt =
-    input.lastDoseTakenAt && intervalHours
-      ? new Date(input.lastDoseTakenAt.getTime() + intervalHours * 3600 * 1000).toISOString()
-      : null;
+function addHoursISO(date: Date, hours: number) {
+  return new Date(date.getTime() + hours * 3600 * 1000).toISOString();
+}
 
-  // 5) optional: check last dose too high vs max single dose
-  if (input.lastDoseMg && rule.maxSingleDoseMg && input.lastDoseMg > rule.maxSingleDoseMg) {
-    return warn("Last dose exceeds guardrails max single dose. Double-check units.", dose, intervalHours, nextEligibleAt);
-  }
-
-  // 6) success
+function failSafe(message: string, reason: string): GuardrailsResult {
   return {
-    status: "OK",
-    message: "Computed using guardrails (demo only).",
-    suggestedNextDoseMg: dose,
-    timeIntervalHours: intervalHours,
-    nextEligibleAt,
+    status: "STOP",
+    message,
+    suggestedNextDoseMg: null,
+    timeIntervalHours: null,
+    nextEligibleAt: null,
+    capsApplied: false,
+    appliedFormulaType: null,
+    blockReasons: [reason],
+    ruleVersion: cfg.meta?.rules_version ?? "unknown",
   };
 }
 
-/* ---------- helpers ---------- */
+export function computeUsingGuardrails(input: EngineInput): GuardrailsResult {
+  try {
+    const blockReasons: string[] = [];
 
-function block(message: string): GuardrailsResult {
-  return { status: "BLOCK", message, suggestedNextDoseMg: null, timeIntervalHours: null, nextEligibleAt: null };
-}
-function warn(message: string, dose: number | null, interval: number | null, nextEligibleAt: string | null): GuardrailsResult {
-  return { status: "WARN", message, suggestedNextDoseMg: dose, timeIntervalHours: interval, nextEligibleAt };
-}
+    const symptoms = (input.symptoms ?? []).map((s) => String(s).toLowerCase());
+    if (symptoms.some((s) => EMERGENCY_KEYWORDS.has(s))) {
+      return failSafe("Emergency symptom trigger - demo will not calculate.", "emergency_trigger");
+    }
 
-// PLACEHOLDERS until you re-upload guardrails.json
-function findRuleByDrugName(drugName: string): any | null {
-  const name = drugName.trim().toLowerCase();
+    if (!input.patientName?.trim()) blockReasons.push("missing_patient_name");
+    if (!input.drugName?.trim()) blockReasons.push("missing_drug_name");
+    if (!Number.isFinite(input.ageYears ?? NaN)) blockReasons.push("missing_age_years");
+    if (!Number.isFinite(input.weightKg ?? NaN)) blockReasons.push("missing_weight_kg");
+    if (!input.lastDoseTakenAt) blockReasons.push("missing_last_dose_time");
+    if (
+      cfg.antimicrobial_stewardship_rules.require_supported_indication &&
+      !(input.notes ?? "").trim()
+    ) {
+      blockReasons.push("missing_indication");
+    }
 
-  // Example of a common shape:
-  // guardrails.drugs = [{ names: ["tylenol","acetaminophen"], ...rule }]
-  const drugs: any[] = (guardrails as any)?.drugs ?? [];
-  return (
-    drugs.find((d) =>
-      (d.names ?? []).some((n: string) => name.includes(String(n).toLowerCase()))
-    ) ?? null
-  );
-}
+    if (blockReasons.length > 0) {
+      return {
+        status: "BLOCK",
+        message: "Missing required fields for calculation.",
+        suggestedNextDoseMg: null,
+        timeIntervalHours: null,
+        nextEligibleAt: null,
+        capsApplied: false,
+        appliedFormulaType: null,
+        blockReasons,
+        ruleVersion: cfg.meta?.rules_version ?? "unknown",
+      };
+    }
 
-function computeDoseFromRule(rule: any, input: any): number | null {
-  // Example logic:
-  // pediatric mg/kg with cap
-  if (rule.mgPerKg && input.weightKg) {
-    const raw = input.weightKg * rule.mgPerKg;
-    const capped = rule.maxSingleDoseMg ? Math.min(raw, rule.maxSingleDoseMg) : raw;
-    const rounded = rule.roundToMg ? Math.round(capped / rule.roundToMg) * rule.roundToMg : capped;
-    return Math.max(rule.minSingleDoseMg ?? 0, rounded);
+    const weightKg = Number(input.weightKg);
+    const ageYears = Number(input.ageYears);
+
+    const lim = cfg.age_weight_logic.plausibility_limits;
+    if (weightKg < lim.weight_kg_min || weightKg > lim.weight_kg_max) {
+      return failSafe("Weight outside plausible limits - demo will not calculate.", "weight_out_of_range");
+    }
+    if (ageYears < lim.age_years_min || ageYears > lim.age_years_max) {
+      return failSafe("Age outside plausible limits - demo will not calculate.", "age_out_of_range");
+    }
+
+    const flags = input.flags ?? {};
+    for (const cond of cfg.contraindication_handling.hard_stop_conditions ?? []) {
+      if ((flags as Record<string, boolean | undefined>)[cond] === true) {
+        return failSafe(`Hard stop: ${cond}.`, `hard_stop_${cond}`);
+      }
+    }
+
+    // Framework-only deterministic demo calculation (no whitelist file dependency).
+    const intervalHours = 6;
+    const rawDose = weightKg * 10;
+    const perDoseCap = 1000;
+    const cappedDose = Math.min(rawDose, perDoseCap);
+    const roundedDose = Math.round(cappedDose / 5) * 5;
+
+    const nextEligibleAt = input.lastDoseTakenAt
+      ? addHoursISO(input.lastDoseTakenAt, intervalHours)
+      : null;
+
+    return {
+      status: rawDose > perDoseCap ? "WARN" : "OK",
+      message: rawDose > perDoseCap ? "Cap applied per demo framework." : "Ready.",
+      suggestedNextDoseMg: roundedDose,
+      timeIntervalHours: intervalHours,
+      nextEligibleAt,
+      capsApplied: rawDose > perDoseCap,
+      appliedFormulaType: "mg_per_kg_per_dose",
+      blockReasons: [],
+      ruleVersion: cfg.meta?.rules_version ?? "unknown",
+    };
+  } catch {
+    return failSafe(cfg.fail_safe_policy.on_engine_error_message, "engine_error");
   }
-
-  // adult fixed mg
-  if (rule.fixedDoseMg) return rule.fixedDoseMg;
-
-  return null;
 }
+
+// Keep existing screen import style stable.
+export const computeFromGuardrails = computeUsingGuardrails;

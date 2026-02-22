@@ -1,0 +1,51 @@
+{
+  "meta": {
+    "rules_version": "1.0.0-demo"
+  },
+  "age_weight_logic": {
+    "auto_convert_lbs_to_kg": false,
+    "plausibility_limits": {
+      "weight_kg_min": 1,
+      "weight_kg_max": 300,
+      "age_years_min": 0,
+      "age_years_max": 120
+    },
+    "pediatric_adult_transition_logic": {
+      "apply_adult_caps_if_age_years_gte": 18
+    }
+  },
+  "contraindication_handling": {
+    "hard_stop_conditions": [
+      "drug_allergy",
+      "class_allergy",
+      "active_gi_bleed",
+      "severe_liver_disease",
+      "severe_renal_failure"
+    ]
+  },
+  "antimicrobial_stewardship_rules": {
+    "require_supported_indication": true
+  },
+  "calculation_framework": {
+    "rounding_policy": {
+      "no_rounding_up_beyond_caps": true
+    }
+  },
+  "emergency_escalation": {
+    "hard_stop_symptoms": [
+      "chest pain",
+      "severe breathing difficulty",
+      "seizure",
+      "unresponsiveness",
+      "anaphylaxis",
+      "severe persistent vomiting",
+      "suicidal intent"
+    ]
+  },
+  "fail_safe_policy": {
+    "on_engine_error_message": "Unable to calculate safely in demo mode."
+  },
+  "ai_output_guardrails": {
+    "ai_must_not_generate_new_dose_numbers": true
+  }
+}

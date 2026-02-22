@@ -1,0 +1,304 @@
+{
+  "title": "Medical AI Guardrails (Hackathon Demo – Deterministic Engine)",
+  "sections": [
+    {
+      "section": "1️⃣ Scope Control Guardrails",
+      "guards": [
+        {
+          "id": "G1",
+          "title": "Whitelist Enforcement (Hard Boundary)",
+          "rules": [
+            "Only drugs explicitly defined in the rules engine may produce dosing outputs.",
+            "Any drug not in whitelist → status = WARN",
+            "No fallback inference.",
+            "No “closest match” logic.",
+            "No free-text medication parsing."
+          ]
+        },
+        {
+          "id": "G2",
+          "title": "Indication Restriction",
+          "rules": [
+            "Each drug must have explicitly defined supported indications.",
+            "If indication ∉ whitelist → status = WARN",
+            "Engine must not generalize dosing across conditions."
+          ]
+        },
+        {
+          "id": "G3",
+          "title": "No Off-Label Support",
+          "rules": [
+            "If the indication does not match monograph-supported conditions in the engine → block calculation."
+          ]
+        }
+      ]
+    },
+    {
+      "section": "2️⃣ Input Integrity Guardrails",
+      "guards": [
+        {
+          "id": "G4",
+          "title": "Required Inputs (Calculation Lock)",
+          "rules": [
+            "Dose calculation is disabled unless all required fields are present:",
+            "Age",
+            "Weight (kg only)",
+            "Indication",
+            "Drug selection",
+            "Last dose time (if calculating next dose)",
+            "Contraindication flags (allergy, renal/hepatic if applicable)",
+            "Missing field → status = WARN"
+          ]
+        },
+        {
+          "id": "G5",
+          "title": "Unit Protection",
+          "rules": [
+            "Weight must be entered in kg.",
+            "If lbs entered → auto-convert and visibly confirm conversion.",
+            "No calculation allowed using ambiguous units.",
+            "No support for teaspoons/tablespoons."
+          ]
+        },
+        {
+          "id": "G6",
+          "title": "Plausibility Filters",
+          "rules": [
+            "Block if:",
+            "Weight < 1 kg or > 300 kg",
+            "Age negative or unrealistic",
+            "Pediatric age + extreme adult weight mismatch",
+            "Dose interval < defined minimum",
+            "Return status = STOP for impossible values."
+          ]
+        }
+      ]
+    },
+    {
+      "section": "3️⃣ Calculation Safety Guardrails",
+      "guards": [
+        {
+          "id": "G7",
+          "title": "Deterministic Formula Only",
+          "rules": [
+            "All dosing must follow:",
+            "Dose (mg) = Weight (kg) × Dose (mg/kg)",
+            "No AI arithmetic.",
+            "No adaptive learning.",
+            "No self-modifying logic."
+          ]
+        },
+        {
+          "id": "G8",
+          "title": "Maximum Dose Caps (Non-Bypassable)",
+          "rules": [
+            "Engine must enforce:",
+            "Per-dose max",
+            "Total daily max",
+            "Adult maximum override",
+            "If calculated value exceeds cap:",
+            "Cap is applied",
+            "Return caps_applied = true",
+            "Add warning message",
+            "No override permitted."
+          ]
+        },
+        {
+          "id": "G9",
+          "title": "Frequency Enforcement",
+          "rules": [
+            "Only predefined intervals allowed (e.g., q4–6h, q6–8h).",
+            "No dynamic interval generation.",
+            "If next dose time violates minimum interval → block."
+          ]
+        }
+      ]
+    },
+    {
+      "section": "4️⃣ Contraindication Guardrails",
+      "guards": [
+        {
+          "id": "G10",
+          "title": "Hard Stops",
+          "rules": [
+            "Return status = STOP if:",
+            "Known severe allergy to selected drug class",
+            "Active GI bleed (for NSAIDs)",
+            "Severe liver disease (for acetaminophen if you support that flag)",
+            "Severe renal failure (if not supported in engine)",
+            "Age below supported minimum",
+            "No dosing output allowed."
+          ]
+        },
+        {
+          "id": "G11",
+          "title": "Soft Warnings",
+          "rules": [
+            "Return status = WARN if:",
+            "Mild renal impairment",
+            "Concurrent interacting OTC drugs",
+            "Duplicate therapy detected",
+            "Dehydration risk",
+            "Calculation may proceed only if within supported logic."
+          ]
+        }
+      ]
+    },
+    {
+      "section": "5️⃣ Emergency Escalation Guardrails",
+      "guards": [
+        {
+          "id": "G12",
+          "title": "Red-Flag Symptom Filter",
+          "rules": [
+            "If user reports:",
+            "Chest pain",
+            "Severe breathing difficulty",
+            "Seizure",
+            "Unresponsiveness",
+            "Anaphylaxis symptoms",
+            "Severe persistent vomiting",
+            "Suicidal intent",
+            "Immediately:",
+            "status = STOP",
+            "supported = false",
+            "Show emergency guidance.",
+            "No dosing shown."
+          ]
+        }
+      ]
+    },
+    {
+      "section": "6️⃣ AI Output Guardrails",
+      "guards": [
+        {
+          "id": "G13",
+          "title": "No Free-Form Dosing Advice",
+          "rules": [
+            "AI summary must:",
+            "Not introduce new medications",
+            "Not adjust doses",
+            "Not recommend titration",
+            "Not override engine",
+            "AI can only:",
+            "Explain calculated result",
+            "Provide safety warnings",
+            "Suggest consulting professional"
+          ]
+        },
+        {
+          "id": "G14",
+          "title": "Refusal Pattern",
+          "rules": [
+            "If user asks:",
+            "“What dose should I take?”",
+            "“Is 800 mg okay?”",
+            "“Can I double the dose?”",
+            "AI must respond:",
+            "“I cannot provide individualized dosing advice. Please consult a healthcare professional.”"
+          ]
+        }
+      ]
+    },
+    {
+      "section": "7️⃣ Exception Handling Logic",
+      "guards": [
+        {
+          "id": "E1",
+          "title": "Data Uncertainty",
+          "rules": [
+            "If weight is estimated:",
+            "Warn user dosing may be inaccurate.",
+            "Encourage confirmation."
+          ]
+        },
+        {
+          "id": "E2",
+          "title": "Multiple Doses Logged",
+          "rules": [
+            "If total daily dose would exceed max:",
+            "Block further suggestion.",
+            "Warn overdose risk."
+          ]
+        },
+        {
+          "id": "E3",
+          "title": "Pediatric-to-Adult Crossover",
+          "rules": [
+            "If weight-based math exceeds adult max:",
+            "Apply adult max.",
+            "Flag adult_cap_applied = true"
+          ]
+        }
+      ]
+    },
+    {
+      "section": "8️⃣ Logging + Audit Guardrails",
+      "guards": [
+        {
+          "id": "G17",
+          "title": "Logging Requirements",
+          "rules": [
+            "Every request must log:",
+            "Raw inputs",
+            "Normalized inputs (kg, age)",
+            "Applied rule version",
+            "Caps applied flag",
+            "Block reasons",
+            "Status",
+            "No silent overrides."
+          ]
+        }
+      ]
+    },
+    {
+      "section": "9️⃣ Fail-Safe Behavior",
+      "guards": [
+        {
+          "id": "G18",
+          "title": "System Failure Response",
+          "rules": [
+            "If:",
+            "Engine crashes",
+            "Rule version mismatch",
+            "AI timeout",
+            "Data parsing error",
+            "Then:",
+            "status = STOP",
+            "message = \"Unable to safely calculate. Please consult a professional.\"",
+            "Never return partial calculation."
+          ]
+        }
+      ]
+    },
+    {
+      "section": "🔟 Demo Legal Guardrails",
+      "guards": [
+        {
+          "id": "G19",
+          "title": "Legal + Ethical Safety",
+          "rules": [
+            "Persistent “Demo only — not medical advice” banner.",
+            "Footer disclaimer on every result card.",
+            "No storage of PHI beyond demo scope.",
+            "No clinical claims (“clinically approved”, “official guideline compliant”, etc.)"
+          ]
+        }
+      ]
+    },
+    {
+      "section": "🔒 Golden Rule for Demo Safety",
+      "rules": [
+        "If any:",
+        "Input uncertainty",
+        "Out-of-scope drug",
+        "Contraindication flag",
+        "Emergency symptom",
+        "Calculation anomaly",
+        "→ Do not calculate.",
+        "→ Return WARN or STOP.",
+        "→ Escalate to clinician advice."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "version": "1.0.0-demo",
+  "drugs": [
+    {
+      "canonical": "acetaminophen",
+      "match_contains": ["ACETAMINOPHEN", "TYLENOL"],
+      "supported_indications": ["fever", "pain"],
+      "formula_type": "mg_per_kg_per_dose",
+      "peds": {
+        "mg_per_kg": 15,
+        "interval_hours": 6,
+        "per_dose_cap_mg": 1000,
+        "daily_cap_mg": 4000
+      },
+      "adult": {
+        "fixed_dose_mg": 500,
+        "interval_hours": 6,
+        "per_dose_cap_mg": 1000,
+        "daily_cap_mg": 4000
+      }
+    },
+    {
+      "canonical": "ibuprofen",
+      "match_contains": ["IBUPROFEN", "ADVIL", "MOTRIN"],
+      "supported_indications": ["fever", "pain", "inflammation"],
+      "formula_type": "mg_per_kg_per_dose",
+      "peds": {
+        "mg_per_kg": 10,
+        "interval_hours": 8,
+        "per_dose_cap_mg": 400,
+        "daily_cap_mg": 1200
+      },
+      "adult": {
+        "fixed_dose_mg": 200,
+        "interval_hours": 8,
+        "per_dose_cap_mg": 400,
+        "daily_cap_mg": 1200
+      }
+    }
+  ]
+}

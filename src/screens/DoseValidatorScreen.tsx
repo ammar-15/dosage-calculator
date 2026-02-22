@@ -18,10 +18,7 @@ import {
   searchBrandSuggestions,
   type BrandSuggestion,
 } from "../lib/drugSearch";
-import {
-  computeFromGuardrails,
-  type GuardrailsResult,
-} from "../lib/guardrailsEngine";
+import { type GuardrailsResult } from "../lib/guardrailsEngine";
 import { supabase } from "../lib/supabase";
 
 type NativeDateTimePickerEvent = {
@@ -121,7 +118,7 @@ export default function DoseValidatorScreen() {
 
   const [result, setResult] = useState<GuardrailsResult | null>(null);
   const [aiSummary, setAiSummary] = useState<string | null>(null);
-  const [aiWarnings, setAiWarnings] = useState<string | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
 
   const [drugQuery, setDrugQuery] = useState("");
   const [suggestions, setSuggestions] = useState<BrandSuggestion[]>([]);
@@ -129,7 +126,6 @@ export default function DoseValidatorScreen() {
   const [isSearching, setIsSearching] = useState(false);
 
   const [selectedDrug, setSelectedDrug] = useState<BrandSuggestion | null>(null);
-  const [selectedDrugCode, setSelectedDrugCode] = useState<string | null>(null);
 
   const [lastTakenDate, setLastTakenDate] = useState<Date | null>(null);
   const [showDatePicker, setShowDatePicker] = useState(false);
@@ -143,7 +139,7 @@ export default function DoseValidatorScreen() {
   useEffect(() => {
     // AI must remain submit-only in perceived UX.
     setAiSummary(null);
-    setAiWarnings(null);
+    setAiLoading(false);
   }, [
     liveValues.patientName,
     liveValues.weightKg,
@@ -234,71 +230,57 @@ export default function DoseValidatorScreen() {
     setShowSuggestions(false);
 
     setSelectedDrug(item);
-    setSelectedDrugCode(item.drug_code ?? null);
   };
 
   const onSubmit = async (values: FormValues) => {
     setAiSummary(null);
-    setAiWarnings(null);
+    setAiLoading(true);
 
-    const ruleResult = computeFromGuardrails({
-      patientName: values.patientName,
-      weightKg: values.weightKg ? Number(values.weightKg) : null,
-      ageYears: values.ageYears ? Number(values.ageYears) : null,
-      gender: values.gender ?? null,
-      drugName: values.drugName ?? "",
-      lastDoseMg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
-      lastDoseTakenAt: lastTakenDate,
-      notes: values.notes ?? null,
-      flags: {},
-      symptoms: [],
-    });
-
-    setResult(ruleResult);
-
-    if (ruleResult.status === "BLOCK" || ruleResult.status === "STOP") {
-      return;
-    }
-
-    const invokeBody = {
-      patient_name: values.patientName.trim(),
-      drug_display_name: values.drugName?.trim() ?? "",
-      drug_canonical: selectedDrugCode?.trim() ? selectedDrugCode : "unknown",
-      profile: {
+    const { data, error: invokeError } = await supabase.functions.invoke("dose_ai", {
+      body: {
+        patient_name: values.patientName,
         weight_kg: values.weightKg ? Number(values.weightKg) : null,
         age_years: values.ageYears ? Number(values.ageYears) : null,
         gender: values.gender ?? null,
+        drug_name: values.drugName ?? "",
+        last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
+        last_dose_time: lastTakenDate?.toISOString() ?? null,
+        patient_notes: values.notes ?? null,
       },
-      computed: {
-        suggested_next_dose_mg: ruleResult.suggestedNextDoseMg,
-        time_interval_hours: ruleResult.timeIntervalHours,
-        next_eligible_at: ruleResult.nextEligibleAt,
-      },
-      additional_comments: values.notes?.trim() ?? null,
+    });
+
+    setAiLoading(false);
+
+    if (invokeError) {
+      setSnack({ visible: true, text: `AI function error: ${invokeError.message}` });
+      return;
+    }
+
+    const ruleResult: GuardrailsResult = {
+      status: (data?.status as GuardrailsResult["status"]) ?? "BLOCK",
+      message: typeof data?.message === "string" ? data.message : "Calculation failed.",
+      suggestedNextDoseMg:
+        typeof data?.suggested_next_dose_mg === "number" ? data.suggested_next_dose_mg : null,
+      timeIntervalHours:
+        typeof data?.interval_hours === "number" ? data.interval_hours : null,
+      nextEligibleAt:
+        typeof data?.next_eligible_time === "string" ? data.next_eligible_time : null,
+      capsApplied: false,
+      appliedFormulaType: null,
+      blockReasons: [],
+      ruleVersion: "edge",
     };
 
-    let aiSummaryValue: string | null = null;
-    let aiWarningsValue: string | null = null;
-    let aiModelValue: string | null = null;
+    setResult(ruleResult);
 
-    const { data: aiData, error: aiError } = await supabase.functions.invoke(
-      "dose_ai",
-      { body: invokeBody },
-    );
+    const aiSummaryValue =
+      typeof data?.ai_summary === "string" && data.ai_summary.trim()
+        ? data.ai_summary
+        : "AI explanation unavailable.";
+    setAiSummary(aiSummaryValue);
 
-    if (aiError) {
-      setSnack({
-        visible: true,
-        text: `AI summary unavailable: ${aiError.message}`,
-      });
-    } else {
-      aiSummaryValue = typeof aiData?.ai_summary === "string" ? aiData.ai_summary : null;
-      aiWarningsValue =
-        typeof aiData?.ai_warnings === "string" ? aiData.ai_warnings : null;
-      aiModelValue = typeof aiData?.ai_model === "string" ? aiData.ai_model : null;
-
-      setAiSummary(aiSummaryValue);
-      setAiWarnings(aiWarningsValue);
+    if (ruleResult.status === "BLOCK" || ruleResult.status === "STOP") {
+      return;
     }
 
     const payload = {
@@ -309,13 +291,13 @@ export default function DoseValidatorScreen() {
       drug_name: values.drugName?.trim() ?? null,
       last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
       last_dose_taken_at: lastTakenDate ? lastTakenDate.toISOString() : null,
-      additional_comments: values.notes?.trim() ?? null,
+      patient_notes: values.notes?.trim() ?? null,
       suggested_next_dose_mg: ruleResult.suggestedNextDoseMg,
       time_interval_hours: ruleResult.timeIntervalHours,
       next_eligible_at: ruleResult.nextEligibleAt,
       ai_summary: aiSummaryValue,
-      ai_warnings: aiWarningsValue,
-      ai_model: aiModelValue,
+      ai_warnings: null,
+      ai_model: null,
     };
 
     const { error } = await supabase.from("patient_data").insert(payload);
@@ -436,7 +418,6 @@ export default function DoseValidatorScreen() {
                     onChange(text);
                     setDrugQuery(text);
                     setSelectedDrug(null);
-                    setSelectedDrugCode(null);
                     if (text.trim().length >= 2) {
                       setShowSuggestions(true);
                     } else {
@@ -484,6 +465,7 @@ export default function DoseValidatorScreen() {
                       <List.Item
                         key={`${item.brand_name}-${item.drug_code ?? "none"}-${index}`}
                         title={item.brand_name ?? "Unknown"}
+                        description={item.din ? `DIN: ${item.din}` : undefined}
                         onPress={() => onSelectSuggestion(item)}
                       />
                     ))}
@@ -623,12 +605,19 @@ export default function DoseValidatorScreen() {
             Next eligible at: {formatIsoOrDash(result?.nextEligibleAt ?? null)}
           </Text>
 
-          {aiSummary ? (
-            <Text style={{ color: "rgba(255,255,255,0.9)" }}>AI summary: {aiSummary}</Text>
-          ) : null}
-          {aiWarnings ? (
-            <Text style={{ color: "rgba(255,214,165,0.95)" }}>AI warnings: {aiWarnings}</Text>
-          ) : null}
+          {aiLoading && (
+            <Text style={{ marginTop: 10, color: "rgba(255,255,255,0.85)" }}>
+              Generating AI explanation...
+            </Text>
+          )}
+          {aiSummary && (
+            <View style={{ marginTop: 12 }}>
+              <Text style={{ fontWeight: "600", color: "rgba(255,255,255,0.92)" }}>
+                AI Explanation
+              </Text>
+              <Text style={{ color: "rgba(255,255,255,0.86)" }}>{aiSummary}</Text>
+            </View>
+          )}
 
           <Divider style={{ marginVertical: 8 }} />
 
@@ -663,11 +652,10 @@ export default function DoseValidatorScreen() {
           reset({ gender: "other" });
           setResult(null);
           setAiSummary(null);
-          setAiWarnings(null);
+          setAiLoading(false);
           setSuggestions([]);
           setShowSuggestions(false);
           setSelectedDrug(null);
-          setSelectedDrugCode(null);
           setLastTakenDate(null);
           setShowDatePicker(false);
           setShowTimePicker(false);

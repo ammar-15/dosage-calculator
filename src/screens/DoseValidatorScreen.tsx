@@ -462,7 +462,6 @@ export default function DoseValidatorScreen() {
                       <List.Item
                         key={`${item.brand_name}-${item.drug_code ?? "none"}-${index}`}
                         title={item.brand_name ?? "Unknown"}
-                        description={item.din ? `DIN: ${item.din}` : undefined}
                         onPress={() => onSelectSuggestion(item)}
                       />
                     ))}

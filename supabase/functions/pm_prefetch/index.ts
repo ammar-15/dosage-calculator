@@ -6,7 +6,14 @@ type PrefetchReq = {
   drug_codes?: string[] | null;
 };
 
-type CacheStatus = "PENDING" | "FETCHING" | "OK" | "NO_PDF" | "FAIL";
+type CacheStatus =
+  | "NEW"
+  | "FETCHING"
+  | "PARSING"
+  | "OK"
+  | "NO_PDF"
+  | "FETCH_FAIL"
+  | "PARSE_FAIL";
 
 type PrefetchDetail = {
   drug_code: string;
@@ -325,7 +332,7 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
         din: srcRow.din ?? null,
         pm_pdf_url: srcRow.pm_pdf_url ?? null,
         pm_date: srcRow.pm_date ?? null,
-        cache_status: "PENDING" as CacheStatus,
+        cache_status: "NEW" as CacheStatus,
         updated_at: new Date().toISOString(),
       },
       { onConflict: "drug_code" },
@@ -379,6 +386,14 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       return { drug_code: drugCode, status: "OK" };
     }
 
+    await sb
+      .from("dpd_pm_cache")
+      .update({
+        cache_status: "PARSING" as CacheStatus,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("drug_code", drugCode);
+
     const extracted = await openaiExtractPdfToJson(pmUrl);
     await sb
       .from("dpd_pm_cache")
@@ -399,7 +414,7 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
     await sb
       .from("dpd_pm_cache")
       .update({
-        cache_status: "FAIL" as CacheStatus,
+        cache_status: "PARSE_FAIL" as CacheStatus,
         cache_error: msg,
         updated_at: new Date().toISOString(),
       })

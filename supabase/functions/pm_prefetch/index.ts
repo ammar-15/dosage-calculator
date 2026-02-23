@@ -30,7 +30,9 @@ const sb = createClient(PROJECT_URL, SERVICE_KEY);
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
 function json(status: number, body: unknown) {
@@ -44,29 +46,24 @@ function isUsableExtractedJson(v: any): boolean {
   return !!v && Array.isArray(v?.rules) && v.rules.length > 0;
 }
 
-async function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+async function quickPdfHeaderCheck(url: string) {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "DoseValidatorHackathon/1.0",
+      Range: "bytes=0-1023",
+      Accept: "application/pdf,*/*",
+    },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-async function fetchWithRetry(url: string, max = 4): Promise<Response> {
-  let lastErr: unknown = null;
-  for (let i = 1; i <= max; i++) {
-    try {
-      const res = await fetch(url, {
-        headers: {
-          "User-Agent": "DoseValidatorHackathon/1.0",
-          Accept: "application/pdf,*/*",
-        },
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res;
-    } catch (e) {
-      lastErr = e;
-      const backoff = 300 * Math.pow(2, i - 1) + Math.floor(Math.random() * 250);
-      await sleep(backoff);
-    }
-  }
-  throw lastErr ?? new Error("fetch failed");
+  const buf = new Uint8Array(await res.arrayBuffer());
+  const isPdf =
+    buf.length >= 4 &&
+    buf[0] === 0x25 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x44 &&
+    buf[3] === 0x46;
+  if (!isPdf) throw new Error("Not a valid PDF");
 }
 
 async function openaiExtractPdfToJson(pmUrl: string) {
@@ -216,34 +213,52 @@ SCHEMA:
 
 Also include a compact audit trail in sections and rule.source.excerpts (short snippets).
 Output JSON only.
+Limit sections to at most 10 entries.
+Truncate section.text to max 1200 characters.
 `;
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      response_format: { type: "json_object" },
-      max_output_tokens: 4000,
-      input: [
-        {
-          role: "system",
-          content: [{ type: "input_text", text: prompt }],
-        },
-        {
-          role: "user",
-          content: [
-            { type: "input_file", file_url: pmUrl },
-            { type: "input_text", text: "Extract dosing-relevant JSON from this PDF." },
-          ],
-        },
-      ],
-    }),
-  });
+  const ctrl = new AbortController();
+  const timeoutId = setTimeout(() => ctrl.abort(), 70_000);
+  let resp: Response;
+  try {
+    resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: ctrl.signal,
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0,
+        text: { format: { type: "json_object" } },
+        max_output_tokens: 2200,
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: prompt }],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "input_file", file_url: pmUrl },
+              {
+                type: "input_text",
+                text: "Extract dosing-relevant JSON from this PDF.",
+              },
+            ],
+          },
+        ],
+      }),
+    });
+  } catch (e) {
+    if ((e as any)?.name === "AbortError") {
+      throw new Error("OpenAI extraction timed out");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!resp.ok) {
     const t = await resp.text().catch(() => "");
@@ -251,9 +266,30 @@ Output JSON only.
   }
 
   const data = await resp.json();
-  const parsed = data?.output_parsed;
+  const jsonText =
+    typeof data?.output_text === "string" && data.output_text.trim()
+      ? data.output_text
+      : (() => {
+          // fallback: walk output content
+          const parts: string[] = [];
+          for (const item of data?.output ?? []) {
+            for (const c of item?.content ?? []) {
+              if (typeof c?.text === "string" && c.text.trim())
+                parts.push(c.text);
+            }
+          }
+          return parts.join("\n").trim();
+        })();
+
+  if (!jsonText) throw new Error("OpenAI returned empty JSON text");
+
+  const trimmed = jsonText.trim();
+  if (!trimmed.startsWith("{")) {
+    throw new Error("OpenAI did not return a JSON object");
+  }
+  const parsed = JSON.parse(trimmed);
   if (!parsed) {
-    throw new Error("OpenAI response missing output_parsed");
+    throw new Error("OpenAI response missing JSON object");
   }
   if (!isUsableExtractedJson(parsed)) {
     throw new Error("Schema mismatch: extracted_json.rules missing");
@@ -261,7 +297,9 @@ Output JSON only.
   return parsed;
 }
 
-export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> }) {
+export async function pmPrefetchHandler(req: {
+  json: () => Promise<PrefetchReq>;
+}) {
   try {
     const body = (await req.json().catch(() => ({}))) as PrefetchReq;
     const drugCode = String(body.drug_code ?? "").trim();
@@ -276,10 +314,14 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
       .maybeSingle();
 
     if (isUsableExtractedJson(cacheRow?.extracted_json)) {
-      return json(200, { status: "OK", extracted_json: cacheRow?.extracted_json });
+      return json(200, {
+        status: "OK",
+        extracted_json: cacheRow?.extracted_json,
+      });
     }
 
     let pmUrl = String(cacheRow?.pm_pdf_url ?? "").trim();
+    let pmPdfUrlSource: "cache" | "dpd_drug_product_all" = "cache";
     if (!pmUrl) {
       const { data: srcRow } = await sb
         .from("dpd_drug_product_all")
@@ -288,19 +330,33 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
         .maybeSingle();
 
       pmUrl = String(srcRow?.pm_pdf_url ?? "").trim();
+      pmPdfUrlSource = "dpd_drug_product_all";
 
-      await sb.from("dpd_pm_cache").upsert(
-        {
-          drug_code: drugCode,
-          brand_name: srcRow?.brand_name ?? cacheRow?.brand_name ?? null,
-          din: srcRow?.din ?? cacheRow?.din ?? null,
-          pm_pdf_url: srcRow?.pm_pdf_url ?? cacheRow?.pm_pdf_url ?? null,
-          pm_date: srcRow?.pm_date ?? cacheRow?.pm_date ?? null,
-          cache_status: "NEW" as CacheStatus,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "drug_code" },
-      );
+      if (cacheRow) {
+        await sb
+          .from("dpd_pm_cache")
+          .update({
+            brand_name: srcRow?.brand_name ?? cacheRow?.brand_name ?? null,
+            din: srcRow?.din ?? cacheRow?.din ?? null,
+            pm_pdf_url: srcRow?.pm_pdf_url ?? cacheRow?.pm_pdf_url ?? null,
+            pm_date: srcRow?.pm_date ?? cacheRow?.pm_date ?? null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("drug_code", drugCode);
+      } else {
+        await sb.from("dpd_pm_cache").upsert(
+          {
+            drug_code: drugCode,
+            brand_name: srcRow?.brand_name ?? null,
+            din: srcRow?.din ?? null,
+            pm_pdf_url: srcRow?.pm_pdf_url ?? null,
+            pm_date: srcRow?.pm_date ?? null,
+            cache_status: "NEW" as CacheStatus,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "drug_code" },
+        );
+      }
     }
 
     if (!pmUrl) {
@@ -327,18 +383,7 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
       .eq("drug_code", drugCode);
 
     try {
-      const pdfRes = await fetchWithRetry(pmUrl, 4);
-      const buf = new Uint8Array(await pdfRes.arrayBuffer());
-      const isPdf =
-        buf.length >= 4 &&
-        buf[0] === 0x25 &&
-        buf[1] === 0x50 &&
-        buf[2] === 0x44 &&
-        buf[3] === 0x46;
-
-      if (!isPdf) {
-        throw new Error("Not a valid PDF");
-      }
+      await quickPdfHeaderCheck(pmUrl);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "fetch failed";
       await sb
@@ -374,7 +419,11 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
         })
         .eq("drug_code", drugCode);
 
-      return json(200, { status: "OK", extracted_json: extracted });
+      return json(200, {
+        status: "OK",
+        extracted_json: extracted,
+        pm_pdf_url_source: pmPdfUrlSource,
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "parse failed";
       await sb

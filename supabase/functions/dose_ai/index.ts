@@ -29,6 +29,11 @@ type CacheRow = {
   extracted_json: unknown;
 };
 
+type PlausibilityGate = {
+  status: "OK" | "WARN" | "BLOCK";
+  message?: string;
+};
+
 function getEnv(name: string): string {
   const denoVal = (globalThis as any)?.Deno?.env?.get?.(name);
   if (typeof denoVal === "string" && denoVal) return denoVal;
@@ -65,6 +70,68 @@ function safeTime(s: string | null): number {
   if (!s) return 0;
   const t = Date.parse(s);
   return Number.isFinite(t) ? t : 0;
+}
+
+function plausibilityGate(body: DoseReq): PlausibilityGate {
+  const age = asNumber(body.age_years);
+  const wt = asNumber(body.weight_kg);
+
+  if (age == null || wt == null) {
+    return {
+      status: "WARN",
+      message: "Missing age/weight; calculation may be limited.",
+    };
+  }
+
+  if (age < 0 || age > 120) return { status: "BLOCK", message: "Age out of supported range." };
+  if (wt < 1 || wt > 400) return { status: "BLOCK", message: "Weight out of supported range." };
+
+  if (age < 2 && wt > 25) {
+    return { status: "BLOCK", message: "Age/weight combination looks implausible." };
+  }
+  if (age >= 2 && age <= 10 && wt > 80) {
+    return { status: "BLOCK", message: "Age/weight combination looks implausible." };
+  }
+  if (age > 18 && wt < 15) {
+    return { status: "BLOCK", message: "Weight too low for adult; verify input." };
+  }
+  if (age > 18 && wt < 25) {
+    return { status: "WARN", message: "Low weight for adult; verify input." };
+  }
+  if (age >= 10 && age <= 18 && wt > 200) {
+    return { status: "WARN", message: "High weight for teen; verify input." };
+  }
+
+  return { status: "OK" };
+}
+
+function extractMaxDailyMg(extractedJson: unknown): number | null {
+  const dosing = (extractedJson as any)?.recommended_dosing;
+  if (!Array.isArray(dosing)) return null;
+
+  const candidates: number[] = [];
+  for (const row of dosing) {
+    const txt = String(row?.max_text ?? "").toLowerCase();
+    if (!txt) continue;
+    if (!txt.includes("day") && !txt.includes("daily")) continue;
+
+    const gMatches = txt.matchAll(/(\d+(?:\.\d+)?)\s*g(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g);
+    for (const m of gMatches) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n)) candidates.push(n * 1000);
+    }
+
+    const mgMatches = txt.matchAll(
+      /(\d+(?:\.\d+)?)\s*mg(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g,
+    );
+    for (const m of mgMatches) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n)) candidates.push(n);
+    }
+  }
+
+  if (!candidates.length) return null;
+  return Math.min(...candidates);
 }
 
 function getTotalDailyMgIfDailyKgRule(
@@ -110,6 +177,21 @@ CRITICAL RULES:
   status="BLOCK" and explain "indication not supported by this monograph JSON".
 - If last_dose_time is null, next_eligible_time must be null (do not invent).
 - Output must be a single per-dose mg value (not total daily).
+- If dose_text contains "mg/kg" AND contains "daily" OR "per day" OR "divided doses" OR "in X doses",
+  interpret as TOTAL DAILY DOSE and divide by number of doses.
+
+PATIENT NOTES RULES (STRICT):
+- You may ONLY change dose/interval based on patient notes if the monograph JSON includes an explicit matching adjustment rule in:
+  - dose_adjustments
+  - contraindications
+  - interactions_affecting_dose
+- If notes mention renal/hepatic/heart/etc but the monograph JSON has no matching dosing adjustment guidance, do NOT adjust dose.
+- In that case, return status="WARN" and patient_specific_notes explaining:
+  "Monograph cache does not contain dosing adjustment guidance for the noted condition."
+
+INDICATION MATCH (STRICT):
+- Only compute if at least one recommended_dosing.indication meaningfully matches patient_notes indication text OR the monograph has a general dosing section that is not indication-specific.
+- If no match, return BLOCK with: "No monograph dosing found for this indication/route in cached data."
 
 Return STRICT JSON only:
 
@@ -203,6 +285,19 @@ ${JSON.stringify(otherVariantMonographs)}
 export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
   try {
     const body = await req.json();
+    const gate = plausibilityGate(body);
+    if (gate.status === "BLOCK") {
+      return json(200, {
+        status: "BLOCK",
+        message: gate.message ?? "Input blocked by plausibility gate.",
+        suggested_next_dose_mg: null,
+        interval_hours: null,
+        next_eligible_time: null,
+        patient_specific_notes: null,
+        ai_summary: "No monograph data available.",
+      });
+    }
+
     const codes =
       Array.isArray(body.drug_codes) && body.drug_codes.length
         ? body.drug_codes.map(String)
@@ -292,15 +387,62 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       });
     }
 
+    if (
+      calc.interval_hours !== null &&
+      (calc.interval_hours < 1 || calc.interval_hours > 72)
+    ) {
+      return json(200, {
+        status: "BLOCK",
+        message: "Interval out of plausible range.",
+        suggested_next_dose_mg: null,
+        interval_hours: null,
+        next_eligible_time: null,
+        patient_specific_notes: null,
+        ai_summary: "No monograph data available.",
+      });
+    }
+
+    const maxDailyMg = extractMaxDailyMg(primary.extracted_json);
+    if (
+      maxDailyMg !== null &&
+      calc.suggested_next_dose_mg !== null &&
+      calc.interval_hours !== null &&
+      calc.interval_hours > 0
+    ) {
+      const estimatedDaily = calc.suggested_next_dose_mg * (24 / calc.interval_hours);
+      if (estimatedDaily > maxDailyMg) {
+        return json(200, {
+          status: "BLOCK",
+          message: "Computed regimen exceeds monograph max daily limit.",
+          suggested_next_dose_mg: null,
+          interval_hours: null,
+          next_eligible_time: null,
+          patient_specific_notes: null,
+          ai_summary: "No monograph data available.",
+        });
+      }
+    }
+
+    const finalStatus =
+      gate.status === "WARN" && calc.status === "OK" ? "WARN" : calc.status;
+    const finalMessage =
+      gate.status === "WARN" && gate.message
+        ? `${calc.message} ${gate.message}`
+        : calc.message;
+    const finalPatientNotes =
+      gate.status === "WARN" && gate.message
+        ? `${gate.message}${calc.patient_specific_notes ? ` ${calc.patient_specific_notes}` : ""}`
+        : calc.patient_specific_notes;
+
     return json(200, {
-      status: calc.status,
-      message: calc.message,
+      status: finalStatus,
+      message: finalMessage,
       suggested_next_dose_mg: calc.suggested_next_dose_mg,
       interval_hours: calc.interval_hours,
       next_eligible_time: calc.next_eligible_time,
-      patient_specific_notes: calc.patient_specific_notes,
+      patient_specific_notes: finalPatientNotes,
       ai_summary:
-        calc.status === "BLOCK"
+        finalStatus === "BLOCK"
           ? "No monograph data available."
           : "Dose computed from monograph cache.",
     });

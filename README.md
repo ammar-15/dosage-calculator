@@ -1,50 +1,94 @@
-# Welcome to your Expo app 👋
+# Dosage Calculator
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+## What this project does
 
-## Get started
+Dosage Calculator is a clinical drug dosage calculation tool.
 
-1. Install dependencies
+It takes:
 
-   ```bash
-   npm install
-   ```
+- Patient age
+- Weight
+- Gender
+- Last medication name
+- Last dose amount
+- Last dose time
+- Indication
 
-2. Start the app
+It calculates:
 
-   ```bash
-   npx expo start
-   ```
+- The appropriate next dose
+- The correct timing for the next dose
 
-In the output, you'll find options to open the app in a
+This is a demo project for technical and educational purposes. It is not clinical advice.
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+## Why I built this
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+This project has been built in collaboration with my wife, [Syeda Arfaa](), who is a medical doctor.
 
-## Get a fresh project
+In daily hospital practice, doctors must manually review Health Canada Product Monographs (PMs) and hospital/clinical dosing guidelines to determine patient-specific dosages.
 
-When you're ready, run:
+This process is repetitive and time-consuming, especially in busy settings where quick and accurate prescribing decisions are critical.
 
-```bash
-npm run reset-project
-```
+The goal was to combine structured clinical reasoning with a clean software system. She helped validate dosing logic and ensure calculations follow real medical practice.
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
 
-## Learn more
+## Data Source
 
-To learn more about developing your project with Expo, look at the following resources:
+The calculator uses a custom drug data API I built.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+The API contains:
 
-## Join the community
+- All drugs listed in the Canadian Drug Product Database (DPD)
+- Product monograph details
+- Indication-specific dosing
+- Standard dosing guidelines
+- Weight-based dosing rules
+- Maximum dose limits
+- Dose interval guidance
 
-Join our community of developers creating universal apps.
+This allows the calculator to dynamically pull official dosing data instead of hardcoding values.
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+## How dosing is calculated
+
+The calculation engine:
+
+- Pulls the drug record from the DPD-based API
+- Reads dosing guidance from the product monograph
+- Applies:
+   - Indication-specific adjustments based on patient details
+- Validates last dose timing
+- Returns one direct next-dose recommendation
+
+All logic follows official product monographs as the primary reference source.
+
+## Tech Stack
+
+**Frontend:**
+
+- React Native (Expo)
+- Supabase (auth and backend)
+
+**Backend:**
+
+- Node.js
+- Custom DPD drug database API
+- OpenAI (controlled reasoning layer)
+- JSON-based dosing rules
+
+## What the system can be used for
+
+- Drug dose validation demos
+- Clinical reasoning simulation
+- Hackathon medical AI projects
+- Educational tools
+- Safe medication timing logic prototypes
+
+## Future Updates
+
+- Dose history tracking
+- Multi-drug validation
+
+## Disclaimer
+
+*This is a demonstration tool.*
+It is not intended for real-world medical decision making....yet :))

@@ -428,10 +428,6 @@ export default function DoseValidatorScreen() {
         : null;
     setPatientSpecificNotes(patientSpecificNotesValue);
 
-    if (ruleResult.status === "BLOCK" || ruleResult.status === "STOP") {
-      return;
-    }
-
     const payload = {
       patient_name: values.patientName.trim(),
       weight_kg: values.weightKg ? Number(values.weightKg) : null,

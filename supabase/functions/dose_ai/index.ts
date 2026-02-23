@@ -11,7 +11,7 @@ type DoseReq = {
 };
 
 type DoseResp = {
-  status: "OK" | "WARN" | "BLOCK";
+  status: "OK" | "WARN";
   message: string;
   suggested_next_dose_mg: number | null;
   interval_hours: number | null;
@@ -20,7 +20,7 @@ type DoseResp = {
 };
 
 type PlausibilityGate = {
-  status: "OK" | "WARN" | "BLOCK";
+  status: "OK" | "WARN";
   message?: string;
 };
 
@@ -63,17 +63,17 @@ function plausibilityGate(body: DoseReq): PlausibilityGate {
     };
   }
 
-  if (age < 0 || age > 120) return { status: "BLOCK", message: "Age out of supported range." };
-  if (wt < 1 || wt > 400) return { status: "BLOCK", message: "Weight out of supported range." };
+  if (age < 0 || age > 120) return { status: "WARN", message: "Age out of supported range." };
+  if (wt < 1 || wt > 400) return { status: "WARN", message: "Weight out of supported range." };
 
   if (age < 2 && wt > 25) {
-    return { status: "BLOCK", message: "Age/weight combination looks implausible." };
+    return { status: "WARN", message: "Age/weight combination looks implausible." };
   }
   if (age >= 2 && age <= 10 && wt > 80) {
-    return { status: "BLOCK", message: "Age/weight combination looks implausible." };
+    return { status: "WARN", message: "Age/weight combination looks implausible." };
   }
   if (age > 18 && wt < 15) {
-    return { status: "BLOCK", message: "Weight too low for adult; verify input." };
+    return { status: "WARN", message: "Weight too low for adult; verify input." };
   }
   if (age > 18 && wt < 25) {
     return { status: "WARN", message: "Low weight for adult; verify input." };
@@ -159,7 +159,7 @@ TOTAL DAILY DOSE HANDLING (STRICT):
 If a matched DOSING rule has then.dose.per_day=true OR then.dose.divided_doses is set,
 treat then.dose.amount as TOTAL DAILY DOSE.
 - If divided_doses is provided, per-dose = total_daily / divided_doses.
-- If divided_doses is missing, return BLOCK (do not guess number of doses).
+- If divided_doses is missing, return WARN and explain why (do not guess number of doses).
 
 Return STRICT JSON only:
 
@@ -210,11 +210,11 @@ ${JSON.stringify(extractedJson)}
 
   const parsed = parseJsonFromContent(content);
   const status =
-    parsed?.status === "OK" ||
-    parsed?.status === "WARN" ||
-    parsed?.status === "BLOCK"
-      ? parsed.status
-      : "BLOCK";
+    parsed?.status === "OK"
+      ? "OK"
+      : parsed?.status === "WARN" || parsed?.status === "BLOCK"
+        ? "WARN"
+        : "WARN";
 
   return {
     status,
@@ -243,27 +243,16 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
   try {
     const body = await req.json();
     const gate = plausibilityGate(body);
-    if (gate.status === "BLOCK") {
-      return json(200, {
-        status: "BLOCK",
-        message: gate.message ?? "Input blocked by plausibility gate.",
-        suggested_next_dose_mg: null,
-        interval_hours: null,
-        next_eligible_time: null,
-        patient_specific_notes: null,
-        ai_summary: gate.message ?? "Input blocked by plausibility gate.",
-      });
-    }
 
     if (!isUsableExtractedJson(body.extracted_json)) {
       return json(200, {
-        status: "BLOCK",
-        message: "No usable Product Monograph data provided.",
+        status: "WARN",
+        message: "Monograph incomplete. Using fallback logic.",
         suggested_next_dose_mg: null,
         interval_hours: null,
         next_eligible_time: null,
         patient_specific_notes: null,
-        ai_summary: "No monograph data available.",
+        ai_summary: "Monograph incomplete.",
       });
     }
 
@@ -274,7 +263,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       (calc.interval_hours < 1 || calc.interval_hours > 72)
     ) {
       return json(200, {
-        status: "BLOCK",
+        status: "WARN",
         message: "Interval out of plausible range.",
         suggested_next_dose_mg: null,
         interval_hours: null,
@@ -294,7 +283,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       const estimatedDaily = calc.suggested_next_dose_mg * (24 / calc.interval_hours);
       if (estimatedDaily > maxDailyMg) {
         return json(200, {
-          status: "BLOCK",
+          status: "WARN",
           message: "Computed regimen exceeds monograph max daily limit.",
           suggested_next_dose_mg: null,
           interval_hours: null,
@@ -323,15 +312,12 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       interval_hours: calc.interval_hours,
       next_eligible_time: calc.next_eligible_time,
       patient_specific_notes: finalPatientNotes,
-      ai_summary:
-        finalStatus === "BLOCK"
-          ? calc.message
-          : "Dose computed from monograph cache.",
+      ai_summary: "Dose computed from monograph cache.",
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "AI dose calculation failed";
     return json(500, {
-      status: "BLOCK",
+      status: "WARN",
       message: msg,
       suggested_next_dose_mg: null,
       interval_hours: null,

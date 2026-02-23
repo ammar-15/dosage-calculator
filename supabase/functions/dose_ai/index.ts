@@ -161,37 +161,32 @@ function getTotalDailyMgIfDailyKgRule(
 async function computeFromMonograph(
   body: DoseReq,
   primaryExtractedJson: unknown,
-  otherVariantMonographs: { drug_code: string; extracted_json: unknown }[],
+  _otherVariantMonographs: { drug_code: string; extracted_json: unknown }[],
 ): Promise<DoseResp> {
   const prompt = `
 Hackathon demo. Not medical advice.
 
-You are given structured dosing-relevant monograph data in JSON plus patient inputs.
-You MUST use ONLY the provided extracted monograph JSON.
-If the monograph does not contain enough info to compute, return BLOCK.
+You are given structured monograph JSON extracted from the PDF.
+You MUST use ONLY extracted_json.rules (and their normalized fields).
+If there is no matching DOSING rule with numeric dose + interval, return BLOCK.
 
-CRITICAL RULES:
-- If monograph says "mg/kg in divided doses" or "mg/kg daily", treat it as TOTAL DAILY DOSE.
-- You MUST divide total daily dose by the number of doses to get per-dose mg.
-- If the indication in patient_notes is not present in recommended_dosing indications, return:
-  status="BLOCK" and explain "indication not supported by this monograph JSON".
-- If last_dose_time is null, next_eligible_time must be null (do not invent).
-- Output must be a single per-dose mg value (not total daily).
-- If dose_text contains "mg/kg" AND contains "daily" OR "per day" OR "divided doses" OR "in X doses",
-  interpret as TOTAL DAILY DOSE and divide by number of doses.
+ABSOLUTE:
+- Do NOT invent any dose numbers.
+- Do NOT infer missing intervals.
+- If route is blocked by any ROUTE rule (then.block=true), you must BLOCK.
+- If contraindication matches (rule_type=CONTRAINDICATION with block=true), you must BLOCK.
 
-PATIENT NOTES RULES (STRICT):
-- You may ONLY change dose/interval based on patient notes if the monograph JSON includes an explicit matching adjustment rule in:
-  - dose_adjustments
-  - contraindications
-  - interactions_affecting_dose
-- If notes mention renal/hepatic/heart/etc but the monograph JSON has no matching dosing adjustment guidance, do NOT adjust dose.
-- In that case, return status="WARN" and patient_specific_notes explaining:
-  "Monograph cache does not contain dosing adjustment guidance for the noted condition."
+MATCHING:
+- Prefer HIGH confidence rules over MED over LOW.
+- Match indication using rule.if.indication_text or pathogen_text against patient_notes (simple substring match is OK).
+- Match population using rule.if.population / age ranges if present.
+- Match route if rule.if.route is not null; otherwise treat as general.
 
-INDICATION MATCH (STRICT):
-- Only compute if at least one recommended_dosing.indication meaningfully matches patient_notes indication text OR the monograph has a general dosing section that is not indication-specific.
-- If no match, return BLOCK with: "No monograph dosing found for this indication/route in cached data."
+TOTAL DAILY DOSE HANDLING (STRICT):
+If a matched DOSING rule has then.dose.per_day=true OR then.dose.divided_doses is set,
+treat then.dose.amount as TOTAL DAILY DOSE.
+- If divided_doses is provided, per-dose = total_daily / divided_doses.
+- If divided_doses is missing, return BLOCK (do not guess number of doses).
 
 Return STRICT JSON only:
 
@@ -210,13 +205,10 @@ age_years=${asNumber(body.age_years)}
 gender=${body.gender ?? null}
 last_dose_mg=${asNumber(body.last_dose_mg)}
 last_dose_time=${body.last_dose_time ?? null}
-notes=${body.patient_notes ?? null}
+patient_notes=${body.patient_notes ?? null}
 
-Primary monograph extracted JSON:
+Primary extracted_json:
 ${JSON.stringify(primaryExtractedJson)}
-
-Other variant monographs:
-${JSON.stringify(otherVariantMonographs)}
 `;
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {

@@ -242,7 +242,7 @@ export default function DoseValidatorScreen() {
   };
 
   const onSelectSuggestion = async (item: BrandSuggestion) => {
-    const MAX_PREFETCH_TRIES = 20;
+    const MAX_PREFETCH_TRIES = 10;
 
     setValue("drugName", item.brand_name ?? "", { shouldDirty: true });
     setDrugQuery(item.brand_name ?? "");

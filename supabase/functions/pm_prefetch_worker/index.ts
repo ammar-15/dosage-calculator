@@ -1,11 +1,6 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-type PrefetchReq = {
-  drug_code?: string | null;
-  drug_codes?: string[] | null;
-};
-
 type CacheStatus =
   | "NEW"
   | "FETCHING"
@@ -20,6 +15,8 @@ type PrefetchDetail = {
   status: "OK" | "NO_PDF" | "FAIL";
   error?: string;
 };
+
+type WorkerReq = { seed_drug_code?: string | null };
 
 function getEnv(name: string): string {
   const denoVal = (globalThis as any)?.Deno?.env?.get?.(name);
@@ -47,20 +44,8 @@ function json(status: number, body: unknown) {
   });
 }
 
-async function triggerWorker(seedDrugCode: string) {
-  // fire-and-forget. Do NOT await in the request path.
-  const url = `${SUPABASE_URL}/functions/v1/pm_prefetch_worker`;
-
-  fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${SERVICE_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ seed_drug_code: seedDrugCode }),
-  }).catch(() => {
-    // swallow errors; request should still succeed
-  });
+async function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -72,10 +57,6 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(hash))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-}
-
-async function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 async function fetchWithRetry(url: string, max = 4): Promise<Response> {
@@ -144,134 +125,23 @@ Only trust content under these headings (or close variants):
 - ADMINISTRATION / RECONSTITUTION / INFUSION
 - ADVERSE REACTIONS / DRUG INTERACTIONS
 
-HEADING DETECTION:
-Treat headings as lines that look like section headers, using variants.
-Assign each paragraph to the most recent heading.
-
-RULE CONVERSION:
-Convert sentences into IF -> THEN rules using trigger phrases.
-
-Indications triggers:
-"indicated for", "used in", "for the treatment of", "therapy of", "suggested for"
-Contra triggers:
-"contraindicated", "should not be used", "must not be used", "avoid"
-Dosing triggers:
-dose patterns (mg/kg, mg), frequency (q6h, every 6 hours), duration, route, infusion time/rate
-Route triggers:
-"must be given orally", "not effective by the oral route", "should never be given intramuscularly"
-Monitoring triggers:
-"monitor", "serum levels", "renal function", "ototoxicity", "nephrotoxicity", "adjust dose"
-
-NORMALIZATION:
-- Normalize headings (e.g., DOSAGE & ADMINISTRATION -> DOSING; WARNINGS AND PRECAUTIONS -> WARNINGS).
-- Normalize routes (intravenous|IV|i.v. -> IV; oral|PO|by mouth -> PO).
-- Normalize common pathogens/conditions where explicitly stated (e.g., MRSA, C. difficile).
-
-CONFIDENCE:
-HIGH: "contraindicated", "should never", "must be given", "not effective"
-MED: "recommended", "should be used", "usual dose"
-LOW: "may", "suggested", "advisable"
-
 OUTPUT:
 Return STRICT JSON ONLY matching this schema.
 Do not invent clinical guidance. If unsure, omit the rule.
 
 SCHEMA:
-
 {
-  "meta": {
-    "drug_name": string|null,
-    "pm_date": string|null,
-    "extraction_version": "v2_rule_first",
-    "source": "dpd_pm_pdf",
-    "source_pages": number|null
-  },
-
-  "sections": [
-    {
-      "heading_raw": string,
-      "heading_norm": "INDICATIONS"|"CONTRAINDICATIONS"|"WARNINGS"|"DOSING"|"SPECIAL_POPULATIONS"|"ADMINISTRATION"|"INTERACTIONS"|"ADVERSE_REACTIONS"|"OTHER",
-      "text": string,
-      "page_refs": number[]
-    }
-  ],
-
-  "normalization": {
-    "heading_map": [{"from": string, "to": string}],
-    "route_map": [{"from": string, "to": "IV"|"PO"|"IM"|"SC"|"INHALATION"|"TOPICAL"|"OTHER"}],
-    "condition_map": [{"from": string, "to": string}]
-  },
-
-  "rules": [
-    {
-      "rule_type": "INDICATION"|"CONTRAINDICATION"|"DOSING"|"ROUTE"|"MONITORING"|"INTERACTION"|"ADVERSE_REACTION",
-      "confidence": "HIGH"|"MED"|"LOW",
-
-      "if": {
-        "population": string|null,
-        "age_min_years": number|null,
-        "age_max_years": number|null,
-        "weight_min_kg": number|null,
-        "weight_max_kg": number|null,
-
-        "indication_text": string|null,
-        "pathogen_text": string|null,
-        "condition_text": string|null,
-
-        "route": "IV"|"PO"|"IM"|"SC"|"INTRATHECAL"|"OTHER"|null,
-        "renal_impairment": "none"|"mild"|"moderate"|"severe"|null,
-        "hepatic_impairment": "none"|"mild"|"moderate"|"severe"|null,
-
-        "contra_flag": string|null,
-        "interaction_text": string|null
-      },
-
-      "then": {
-        "allow": boolean|null,
-        "block": boolean|null,
-
-        "dose": {
-          "amount": number|null,
-          "unit": "mg"|"g"|null,
-          "per_kg": boolean|null,
-          "per_day": boolean|null,
-          "divided_doses": number|null
-        },
-
-        "frequency": {
-          "interval_hours": number|null,
-          "frequency_text": string|null
-        },
-
-        "duration": {
-          "amount": number|null,
-          "unit": "days"|"weeks"|null,
-          "text": string|null
-        },
-
-        "administration": {
-          "infusion_minutes": number|null,
-          "max_rate_mg_per_min": number|null,
-          "dilution_text": string|null
-        },
-
-        "monitoring": {
-          "required": boolean|null,
-          "items": string[]
-        },
-
-        "notes": string|null
-      },
-
-      "source": {
-        "page_refs": number[],
-        "excerpts": string[]
-      }
-    }
-  ]
+  "meta": {"drug_name": string|null, "pm_date": string|null, "extraction_version": "v2_rule_first", "source": "dpd_pm_pdf", "source_pages": number|null},
+  "sections": [{"heading_raw": string, "heading_norm": "INDICATIONS"|"CONTRAINDICATIONS"|"WARNINGS"|"DOSING"|"SPECIAL_POPULATIONS"|"ADMINISTRATION"|"INTERACTIONS"|"ADVERSE_REACTIONS"|"OTHER", "text": string, "page_refs": number[]}],
+  "normalization": {"heading_map": [{"from": string, "to": string}], "route_map": [{"from": string, "to": "IV"|"PO"|"IM"|"SC"|"INHALATION"|"TOPICAL"|"OTHER"}], "condition_map": [{"from": string, "to": string}]},
+  "rules": [{
+    "rule_type": "INDICATION"|"CONTRAINDICATION"|"DOSING"|"ROUTE"|"MONITORING"|"INTERACTION"|"ADVERSE_REACTION",
+    "confidence": "HIGH"|"MED"|"LOW",
+    "if": {"population": string|null, "age_min_years": number|null, "age_max_years": number|null, "weight_min_kg": number|null, "weight_max_kg": number|null, "indication_text": string|null, "pathogen_text": string|null, "condition_text": string|null, "route": "IV"|"PO"|"IM"|"SC"|"INTRATHECAL"|"OTHER"|null, "renal_impairment": "none"|"mild"|"moderate"|"severe"|null, "hepatic_impairment": "none"|"mild"|"moderate"|"severe"|null, "contra_flag": string|null, "interaction_text": string|null},
+    "then": {"allow": boolean|null, "block": boolean|null, "dose": {"amount": number|null, "unit": "mg"|"g"|null, "per_kg": boolean|null, "per_day": boolean|null, "divided_doses": number|null}, "frequency": {"interval_hours": number|null, "frequency_text": string|null}, "duration": {"amount": number|null, "unit": "days"|"weeks"|null, "text": string|null}, "administration": {"infusion_minutes": number|null, "max_rate_mg_per_min": number|null, "dilution_text": string|null}, "monitoring": {"required": boolean|null, "items": string[]}, "notes": string|null},
+    "source": {"page_refs": number[], "excerpts": string[]}
+  }]
 }
-
-Also include a compact audit trail in sections and rule.source.excerpts (short snippets).
 Output JSON only.
 `;
 
@@ -286,10 +156,7 @@ Output JSON only.
       temperature: 0.1,
       max_output_tokens: 4000,
       input: [
-        {
-          role: "system",
-          content: [{ type: "input_text", text: prompt }],
-        },
+        { role: "system", content: [{ type: "input_text", text: prompt }] },
         {
           role: "user",
           content: [
@@ -306,23 +173,18 @@ Output JSON only.
     throw new Error(`OpenAI extraction failed: ${resp.status} ${t}`);
   }
 
-  try {
-    const data = await resp.json();
-    return parseJsonFromResponsesPayload(data);
-  } catch {
-    throw new Error("Failed to parse extracted JSON");
-  }
+  const data = await resp.json();
+  return parseJsonFromResponsesPayload(data);
 }
 
 async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
   try {
     const { data: existing } = await sb
       .from("dpd_pm_cache")
-      .select("cache_status, source_hash, extracted_json, pm_pdf_url, pm_date, updated_at")
+      .select("cache_status, extracted_json")
       .eq("drug_code", drugCode)
       .maybeSingle();
 
-    // If already cached and usable, skip immediately.
     if (existing?.cache_status === "OK" && existing?.extracted_json) {
       return { drug_code: drugCode, status: "OK" };
     }
@@ -333,12 +195,8 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       .eq("drug_code", drugCode)
       .maybeSingle();
 
-    if (srcErr) {
-      return { drug_code: drugCode, status: "FAIL", error: srcErr.message };
-    }
-    if (!srcRow) {
-      return { drug_code: drugCode, status: "FAIL", error: "drug_code not found" };
-    }
+    if (srcErr) return { drug_code: drugCode, status: "FAIL", error: srcErr.message };
+    if (!srcRow) return { drug_code: drugCode, status: "FAIL", error: "drug_code not found" };
 
     const pmUrl = (srcRow.pm_pdf_url ?? "").toString().trim();
     await sb.from("dpd_pm_cache").upsert(
@@ -366,12 +224,6 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       return { drug_code: drugCode, status: "NO_PDF" };
     }
 
-    const { data: cacheRow } = await sb
-      .from("dpd_pm_cache")
-      .select("cache_status, source_hash")
-      .eq("drug_code", drugCode)
-      .maybeSingle();
-
     await sb
       .from("dpd_pm_cache")
       .update({
@@ -385,22 +237,6 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
     const pdfRes = await fetchWithRetry(pmUrl, 4);
     const buf = new Uint8Array(await pdfRes.arrayBuffer());
     const hash = await sha256Hex(buf);
-
-    if (
-      cacheRow?.cache_status === "OK" &&
-      cacheRow?.source_hash &&
-      cacheRow.source_hash === hash
-    ) {
-      await sb
-        .from("dpd_pm_cache")
-        .update({
-          cache_status: "OK" as CacheStatus,
-          fetched_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("drug_code", drugCode);
-      return { drug_code: drugCode, status: "OK" };
-    }
 
     await sb
       .from("dpd_pm_cache")
@@ -439,42 +275,96 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
   }
 }
 
-export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> }) {
-  try {
-    const body = (await req.json().catch(() => ({}))) as PrefetchReq;
-    const code = String(body.drug_code ?? "").trim();
-    if (!code) return json(400, { status: "ERROR", message: "drug_code required" });
+async function getVariantCodes(seedDrugCode: string): Promise<string[]> {
+  const { data: seedRow } = await sb
+    .from("dpd_drug_product_all")
+    .select("drug_code, brand_name, pm_pdf_url")
+    .eq("drug_code", seedDrugCode)
+    .maybeSingle();
 
-    const detail = await prefetchOne(code);
-    const ok = detail.status === "OK" ? 1 : 0;
-    const noPdf = detail.status === "NO_PDF" ? 1 : 0;
-    const fail = detail.status === "FAIL" ? 1 : 0;
+  if (!seedRow) return [seedDrugCode];
 
-    // Kick off background warm-cache (does NOT block response)
-    triggerWorker(code);
+  const variantSet = new Set<string>([seedDrugCode]);
 
-    console.log(`[pm_prefetch] total=1 ok=${ok} no_pdf=${noPdf} fail=${fail}`);
+  if (seedRow.pm_pdf_url) {
+    const { data: rows } = await sb
+      .from("dpd_drug_product_all")
+      .select("drug_code")
+      .eq("pm_pdf_url", seedRow.pm_pdf_url);
 
-    return json(200, {
-      status: "OK",
-      message: "Prefetch complete",
-      total: 1,
-      ok,
-      no_pdf: noPdf,
-      fail,
-      details: [detail],
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "unknown error";
-    return json(500, { status: "ERROR", message: msg });
+    (rows ?? [])
+      .map((r: any) => String(r.drug_code ?? "").trim())
+      .filter(Boolean)
+      .forEach((c) => variantSet.add(c));
   }
+
+  if (seedRow.brand_name) {
+    const { data: rows } = await sb
+      .from("dpd_drug_product_all")
+      .select("drug_code")
+      .eq("brand_name", seedRow.brand_name);
+
+    (rows ?? [])
+      .map((r: any) => String(r.drug_code ?? "").trim())
+      .filter(Boolean)
+      .forEach((c) => variantSet.add(c));
+  }
+
+  return Array.from(variantSet);
 }
 
-export default pmPrefetchHandler;
+async function worker(body: WorkerReq) {
+  const seed = String(body.seed_drug_code ?? "").trim();
+  if (!seed) return json(400, { status: "ERROR", message: "seed_drug_code required" });
 
-serve((req) => {
+  const codes = await getVariantCodes(seed);
+  console.log(`[pm_prefetch_worker] seed=${seed} variants=${codes.length}`);
+
+  let ok = 0;
+  let fail = 0;
+  let noPdf = 0;
+  let skipped = 0;
+
+  for (const code of codes) {
+    const { data: existing } = await sb
+      .from("dpd_pm_cache")
+      .select("cache_status, extracted_json")
+      .eq("drug_code", code)
+      .maybeSingle();
+
+    if (existing?.cache_status === "OK" && existing?.extracted_json) {
+      skipped += 1;
+      continue;
+    }
+
+    try {
+      const detail = await prefetchOne(code);
+      if (detail.status === "OK") ok += 1;
+      else if (detail.status === "NO_PDF") noPdf += 1;
+      else fail += 1;
+      await sleep(1500);
+    } catch (e) {
+      fail += 1;
+      console.log(`[pm_prefetch_worker] code=${code} FAIL ${(e as any)?.message ?? e}`);
+      await sleep(1500);
+    }
+  }
+
+  return json(200, {
+    status: "OK",
+    seed,
+    total: codes.length,
+    ok,
+    no_pdf: noPdf,
+    fail,
+    skipped,
+  });
+}
+
+serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { status: 200, headers: corsHeaders });
   }
-  return pmPrefetchHandler({ json: () => req.json() });
+  const body = (await req.json().catch(() => ({}))) as WorkerReq;
+  return worker(body);
 });

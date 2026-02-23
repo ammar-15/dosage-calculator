@@ -288,43 +288,9 @@ export default function DoseValidatorScreen() {
     // only try a few
     codes = codes.slice(0, MAX_PREFETCH_TRIES);
     setSelectedDrugCodes(codes);
-
-    setPmCacheStatus("loading");
-    setPmCacheMessage(`Prefetching monographs... 0/${codes.length}`);
-    let ok = 0;
-    let noPdf = 0;
-    let fail = 0;
-    let firstOkCode: string | null = null;
-
-    for (let i = 0; i < codes.length; i++) {
-      const code = codes[i];
-      const { data, error } = await supabase.functions.invoke("pm_prefetch", {
-        body: { drug_code: code },
-      });
-
-      if (error) {
-        fail += 1;
-      } else {
-        const st = String(data?.details?.[0]?.status ?? data?.status ?? "").toUpperCase();
-        if (st === "OK") {
-          ok += 1;
-          if (!firstOkCode) firstOkCode = code;
-        } else if (st === "NO_PDF") {
-          noPdf += 1;
-        } else {
-          fail += 1;
-        }
-      }
-
-      setPmCacheMessage(`Prefetching monographs... ${i + 1}/${codes.length} (ok=${ok})`);
-    }
-
-    setPmCounts({ ok, noPdf, fail, total: codes.length });
-    console.log(`[pm_prefetch] total=${codes.length} ok=${ok} no_pdf=${noPdf} fail=${fail}`);
-    if (firstOkCode) setSelectedDrugCode(firstOkCode);
-
-    setPmCacheMessage(`Monographs (${ok}/${codes.length})`);
-    setPmCacheStatus(ok > 0 ? "ok" : noPdf > 0 && fail === 0 ? "no_pdf" : "fail");
+    setPmCounts({ ok: 0, noPdf: 0, fail: 0, total: 0 });
+    setPmCacheStatus("idle");
+    setPmCacheMessage(null);
   };
 
   const onSubmit = async (values: FormValues) => {
@@ -347,6 +313,33 @@ export default function DoseValidatorScreen() {
           return bDate - aDate;
         });
         chosenDrugCode = String(sorted[0]?.drug_code ?? chosenDrugCode ?? "");
+      }
+    }
+
+    if (selectedDrugCode) {
+      setPmCacheStatus("loading");
+      setPmCacheMessage("Prefetching monographs...");
+      const { data: prefetchData, error: prefetchError } = await supabase.functions.invoke(
+        "pm_prefetch",
+        { body: { drug_code: selectedDrugCode } },
+      );
+
+      if (prefetchError) {
+        setPmCounts({ ok: 0, noPdf: 0, fail: 1, total: 1 });
+        setPmCacheStatus("fail");
+        setPmCacheMessage("Monographs (0/1)");
+      } else {
+        const st = String(
+          prefetchData?.details?.[0]?.status ?? prefetchData?.status ?? "",
+        ).toUpperCase();
+        const ok = st === "OK" ? 1 : 0;
+        const noPdf = st === "NO_PDF" ? 1 : 0;
+        const fail = ok === 0 && noPdf === 0 ? 1 : 0;
+        setPmCounts({ ok, noPdf, fail, total: 1 });
+        setPmCacheMessage(`Monographs (${ok}/1)`);
+        if (ok > 0) setPmCacheStatus("ok");
+        else if (noPdf > 0 && fail === 0) setPmCacheStatus("no_pdf");
+        else setPmCacheStatus("fail");
       }
     }
 

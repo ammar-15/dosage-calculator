@@ -31,6 +31,7 @@ function getEnv(name: string): string {
 
 const SUPABASE_URL = getEnv("PROJECT_URL");
 const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
+const ANON_KEY = getEnv("ANON_KEY");
 const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
 
 const sb = createClient(SUPABASE_URL, SERVICE_KEY);
@@ -48,14 +49,12 @@ function json(status: number, body: unknown) {
 }
 
 async function triggerWorker(seedDrugCode: string, drugCodes: string[]) {
-  // fire-and-forget. Do NOT await in the request path.
   const url = `${SUPABASE_URL}/functions/v1/pm_prefetch_worker`;
-
-  fetch(url, {
+  const workerRequest = fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${SERVICE_KEY}`,
-      apikey: SERVICE_KEY,
+      apikey: ANON_KEY,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -63,8 +62,13 @@ async function triggerWorker(seedDrugCode: string, drugCodes: string[]) {
       drug_codes: drugCodes,
     }),
   }).catch(() => {
-    // swallow errors; request should still succeed
+    // request should still succeed if worker kick-off fails
   });
+
+  const edgeRuntime = (globalThis as any)?.EdgeRuntime;
+  if (edgeRuntime && typeof edgeRuntime.waitUntil === "function") {
+    edgeRuntime.waitUntil(workerRequest);
+  }
 }
 
 async function pickSeedDrugCode(drugCodes: string[]): Promise<string> {
@@ -78,7 +82,12 @@ async function pickSeedDrugCode(drugCodes: string[]): Promise<string> {
     .in("drug_code", cleaned);
 
   const rows = data ?? [];
-  const alreadyOk = rows.find((r: any) => r.cache_status === "OK" && r.extracted_json);
+  const alreadyOk = rows.find(
+    (r: any) =>
+      r.cache_status === "OK" &&
+      r.extracted_json &&
+      Array.isArray(r.extracted_json?.rules),
+  );
   if (alreadyOk?.drug_code) return String(alreadyOk.drug_code);
 
   // Otherwise just take first from list.
@@ -345,7 +354,11 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       .maybeSingle();
 
     // If already cached and usable, skip immediately.
-    if (existing?.cache_status === "OK" && existing?.extracted_json) {
+    if (
+      existing?.cache_status === "OK" &&
+      existing?.extracted_json &&
+      Array.isArray((existing.extracted_json as any)?.rules)
+    ) {
       return { drug_code: drugCode, status: "OK" };
     }
 
@@ -404,6 +417,7 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       })
       .eq("drug_code", drugCode);
 
+    console.log(`[pm_prefetch] code=${drugCode} fetching pdf ${pmUrl}`);
     const pdfRes = await fetchWithRetry(pmUrl, 4);
     const buf = new Uint8Array(await pdfRes.arrayBuffer());
     const hash = await sha256Hex(buf);
@@ -432,7 +446,13 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       })
       .eq("drug_code", drugCode);
 
+    console.log(`[pm_prefetch] code=${drugCode} calling openai`);
     const extracted = await openaiExtractPdfToJson(pmUrl);
+    const hasRules = Array.isArray((extracted as any)?.rules);
+    if (!hasRules) {
+      throw new Error("Schema mismatch: extracted_json.rules missing");
+    }
+    console.log(`[pm_prefetch] code=${drugCode} openai done, updating cache`);
     await sb
       .from("dpd_pm_cache")
       .update({

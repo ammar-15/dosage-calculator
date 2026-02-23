@@ -242,7 +242,7 @@ export default function DoseValidatorScreen() {
   };
 
   const onSelectSuggestion = async (item: BrandSuggestion) => {
-    const MAX_PREFETCH_TRIES = 10;
+    const MAX_PREFETCH_TRIES = 20;
 
     setValue("drugName", item.brand_name ?? "", { shouldDirty: true });
     setDrugQuery(item.brand_name ?? "");
@@ -292,36 +292,43 @@ export default function DoseValidatorScreen() {
     setPmCacheMessage("Prefetching monographs...");
     setPmCounts({ ok: 0, noPdf: 0, fail: 0, total: codes.length });
 
-    const { data, error } = await supabase.functions.invoke("pm_prefetch", {
-      body: { drug_codes: codes },
-    });
+    supabase.functions
+      .invoke("pm_prefetch", {
+        body: { drug_codes: codes },
+      })
+      .then(({ data, error }) => {
+        if (error) {
+          setPmCounts({ ok: 0, noPdf: 0, fail: 1, total: 1 });
+          setPmCacheStatus("fail");
+          setPmCacheMessage("Monographs (0/1)");
+          return;
+        }
 
-    if (error) {
-      setPmCounts({ ok: 0, noPdf: 0, fail: 1, total: 1 });
-      setPmCacheStatus("fail");
-      setPmCacheMessage("Monographs (0/1)");
-      return;
-    }
+        const st = String(data?.details?.[0]?.status ?? data?.status ?? "").toUpperCase();
+        const ok = st === "OK" ? 1 : 0;
+        const noPdf = st === "NO_PDF" ? 1 : 0;
+        const fail = ok === 0 && noPdf === 0 ? 1 : 0;
+        setPmCounts({ ok, noPdf, fail, total: 1 });
+        setPmCacheMessage(`Monographs (${ok}/1)`);
 
-    const st = String(data?.details?.[0]?.status ?? data?.status ?? "").toUpperCase();
-    const ok = st === "OK" ? 1 : 0;
-    const noPdf = st === "NO_PDF" ? 1 : 0;
-    const fail = ok === 0 && noPdf === 0 ? 1 : 0;
-    setPmCounts({ ok, noPdf, fail, total: 1 });
-    setPmCacheMessage(`Monographs (${ok}/1)`);
+        const firstOk = Array.isArray(data?.details)
+          ? (data.details as { drug_code?: string; status?: string }[]).find(
+              (d) => String(d.status ?? "").toUpperCase() === "OK",
+            )
+          : null;
+        if (firstOk?.drug_code) {
+          setSelectedDrugCode(String(firstOk.drug_code));
+        }
 
-    const firstOk = Array.isArray(data?.details)
-      ? (data.details as { drug_code?: string; status?: string }[]).find(
-          (d) => String(d.status ?? "").toUpperCase() === "OK",
-        )
-      : null;
-    if (firstOk?.drug_code) {
-      setSelectedDrugCode(String(firstOk.drug_code));
-    }
-
-    if (ok > 0) setPmCacheStatus("ok");
-    else if (noPdf > 0 && fail === 0) setPmCacheStatus("no_pdf");
-    else setPmCacheStatus("fail");
+        if (ok > 0) setPmCacheStatus("ok");
+        else if (noPdf > 0 && fail === 0) setPmCacheStatus("no_pdf");
+        else setPmCacheStatus("fail");
+      })
+      .catch(() => {
+        setPmCounts({ ok: 0, noPdf: 0, fail: 1, total: 1 });
+        setPmCacheStatus("fail");
+        setPmCacheMessage("Monographs (0/1)");
+      });
   };
 
   const onSubmit = async (values: FormValues) => {

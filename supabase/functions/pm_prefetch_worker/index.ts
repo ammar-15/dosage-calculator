@@ -188,7 +188,11 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       .eq("drug_code", drugCode)
       .maybeSingle();
 
-    if (existing?.cache_status === "OK" && existing?.extracted_json) {
+    if (
+      existing?.cache_status === "OK" &&
+      existing?.extracted_json &&
+      Array.isArray((existing.extracted_json as any)?.rules)
+    ) {
       return { drug_code: drugCode, status: "OK" };
     }
 
@@ -237,6 +241,7 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       })
       .eq("drug_code", drugCode);
 
+    console.log(`[pm_prefetch_worker] code=${drugCode} fetching pdf ${pmUrl}`);
     const pdfRes = await fetchWithRetry(pmUrl, 4);
     const buf = new Uint8Array(await pdfRes.arrayBuffer());
     const hash = await sha256Hex(buf);
@@ -249,7 +254,13 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       })
       .eq("drug_code", drugCode);
 
+    console.log(`[pm_prefetch_worker] code=${drugCode} calling openai`);
     const extracted = await openaiExtractPdfToJson(pmUrl);
+    const hasRules = Array.isArray((extracted as any)?.rules);
+    if (!hasRules) {
+      throw new Error("Schema mismatch: extracted_json.rules missing");
+    }
+    console.log(`[pm_prefetch_worker] code=${drugCode} openai done, updating cache`);
     await sb
       .from("dpd_pm_cache")
       .update({
@@ -340,7 +351,11 @@ async function worker(body: WorkerReq) {
       .eq("drug_code", code)
       .maybeSingle();
 
-    if (existing?.cache_status === "OK" && existing?.extracted_json) {
+    if (
+      existing?.cache_status === "OK" &&
+      existing?.extracted_json &&
+      Array.isArray((existing.extracted_json as any)?.rules)
+    ) {
       skipped += 1;
       continue;
     }

@@ -1,9 +1,7 @@
-import { createClient } from "npm:@supabase/supabase-js@2";
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
 type DoseReq = {
-  drug_code?: string | null;
-  drug_codes?: string[] | null;
+  extracted_json?: unknown;
   weight_kg?: number | string | null;
   age_years?: number | string | null;
   gender?: string | null;
@@ -21,14 +19,6 @@ type DoseResp = {
   patient_specific_notes: string | null;
 };
 
-type CacheRow = {
-  drug_code: string | null;
-  pm_date: string | null;
-  updated_at: string | null;
-  cache_status: string | null;
-  extracted_json: unknown;
-};
-
 type PlausibilityGate = {
   status: "OK" | "WARN" | "BLOCK";
   message?: string;
@@ -42,11 +32,7 @@ function getEnv(name: string): string {
   throw new Error(`Missing env: ${name}`);
 }
 
-const PROJECT_URL = getEnv("PROJECT_URL");
-const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
 const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
-
-const sb = createClient(PROJECT_URL, SERVICE_KEY);
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -64,12 +50,6 @@ function json(status: number, body: unknown) {
 function asNumber(v: unknown): number | null {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
-}
-
-function safeTime(s: string | null): number {
-  if (!s) return 0;
-  const t = Date.parse(s);
-  return Number.isFinite(t) ? t : 0;
 }
 
 function plausibilityGate(body: DoseReq): PlausibilityGate {
@@ -105,13 +85,31 @@ function plausibilityGate(body: DoseReq): PlausibilityGate {
   return { status: "OK" };
 }
 
+function isUsableExtractedJson(v: any): boolean {
+  return !!v && Array.isArray(v?.rules) && v.rules.length > 0;
+}
+
+function parseJsonFromContent(content: string): any {
+  const stripped = content
+    .replace(/```json\s*/gi, "")
+    .replace(/```\s*/g, "")
+    .trim();
+  const firstBrace = stripped.indexOf("{");
+  const lastBrace = stripped.lastIndexOf("}");
+  const sliced =
+    firstBrace >= 0 && lastBrace >= 0
+      ? stripped.slice(firstBrace, lastBrace + 1)
+      : stripped;
+  return JSON.parse(sliced);
+}
+
 function extractMaxDailyMg(extractedJson: unknown): number | null {
-  const dosing = (extractedJson as any)?.recommended_dosing;
-  if (!Array.isArray(dosing)) return null;
+  const rules = (extractedJson as any)?.rules;
+  if (!Array.isArray(rules)) return null;
 
   const candidates: number[] = [];
-  for (const row of dosing) {
-    const txt = String(row?.max_text ?? "").toLowerCase();
+  for (const rule of rules) {
+    const txt = String(rule?.then?.notes ?? "").toLowerCase();
     if (!txt) continue;
     if (!txt.includes("day") && !txt.includes("daily")) continue;
 
@@ -134,34 +132,9 @@ function extractMaxDailyMg(extractedJson: unknown): number | null {
   return Math.min(...candidates);
 }
 
-function getTotalDailyMgIfDailyKgRule(
-  extractedJson: unknown,
-  weightKgRaw: number | string | null | undefined,
-): number | null {
-  const weightKg = asNumber(weightKgRaw);
-  if (!weightKg || weightKg <= 0) return null;
-
-  const haystack = JSON.stringify((extractedJson as any)?.recommended_dosing ?? extractedJson);
-  const lower = haystack.toLowerCase();
-  const impliesDaily =
-    lower.includes("mg/kg/day") ||
-    lower.includes("mg/kg per day") ||
-    lower.includes("divided doses") ||
-    lower.includes("divided dose");
-  if (!impliesDaily) return null;
-
-  const mgPerKgMatch = lower.match(/(\d+(?:\.\d+)?)\s*mg\s*\/\s*kg(?:\s*\/\s*day|\s*per\s*day)?/);
-  if (!mgPerKgMatch) return null;
-  const mgPerKg = Number(mgPerKgMatch[1]);
-  if (!Number.isFinite(mgPerKg) || mgPerKg <= 0) return null;
-
-  return mgPerKg * weightKg;
-}
-
 async function computeFromMonograph(
   body: DoseReq,
-  primaryExtractedJson: unknown,
-  _otherVariantMonographs: { drug_code: string; extracted_json: unknown }[],
+  extractedJson: unknown,
 ): Promise<DoseResp> {
   const prompt = `
 Hackathon demo. Not medical advice.
@@ -207,8 +180,8 @@ last_dose_mg=${asNumber(body.last_dose_mg)}
 last_dose_time=${body.last_dose_time ?? null}
 patient_notes=${body.patient_notes ?? null}
 
-Primary extracted_json:
-${JSON.stringify(primaryExtractedJson)}
+extracted_json:
+${JSON.stringify(extractedJson)}
 `;
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -235,15 +208,7 @@ ${JSON.stringify(primaryExtractedJson)}
     throw new Error("Empty OpenAI response");
   }
 
-  const firstBrace = content.indexOf("{");
-  const lastBrace = content.lastIndexOf("}");
-  const sliced =
-    firstBrace >= 0 && lastBrace >= 0
-      ? content.slice(firstBrace, lastBrace + 1)
-      : content;
-
-  const parsed = JSON.parse(sliced);
-
+  const parsed = parseJsonFromContent(content);
   const status =
     parsed?.status === "OK" ||
     parsed?.status === "WARN" ||
@@ -290,15 +255,10 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       });
     }
 
-    const codes =
-      Array.isArray(body.drug_codes) && body.drug_codes.length
-        ? body.drug_codes.map(String)
-        : [(body.drug_code ?? "").toString()].filter(Boolean);
-
-    if (!codes.length) {
+    if (!isUsableExtractedJson(body.extracted_json)) {
       return json(200, {
         status: "BLOCK",
-        message: "drug_code is required",
+        message: "No usable Product Monograph data provided.",
         suggested_next_dose_mg: null,
         interval_hours: null,
         next_eligible_time: null,
@@ -307,77 +267,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       });
     }
 
-    const { data: rows, error: cacheErr } = await sb
-      .from("dpd_pm_cache")
-      .select("drug_code, pm_date, updated_at, cache_status, extracted_json")
-      .in("drug_code", codes);
-
-    if (cacheErr) {
-      return json(500, {
-        status: "BLOCK",
-        message: cacheErr.message,
-        suggested_next_dose_mg: null,
-        interval_hours: null,
-        next_eligible_time: null,
-        patient_specific_notes: null,
-        ai_summary: "No monograph data available.",
-      });
-    }
-
-    const okRows = ((rows ?? []) as CacheRow[]).filter(
-      (r) => r.cache_status === "OK" && r.extracted_json,
-    );
-
-    if (!okRows.length) {
-      return json(200, {
-        status: "BLOCK",
-        message:
-          "No Product Monograph dosing data available in DPD for this product.",
-        suggested_next_dose_mg: null,
-        interval_hours: null,
-        next_eligible_time: null,
-        patient_specific_notes: null,
-        ai_summary: "No monograph data available.",
-      });
-    }
-
-    okRows.sort((a, b) => {
-      const ad = safeTime(a.pm_date) || safeTime(a.updated_at);
-      const bd = safeTime(b.pm_date) || safeTime(b.updated_at);
-      return bd - ad;
-    });
-
-    const primary = okRows[0];
-    const others = okRows.slice(1).map((r) => ({
-      drug_code: String(r.drug_code),
-      extracted_json: r.extracted_json,
-    }));
-
-    const calc = await computeFromMonograph(
-      body,
-      primary.extracted_json,
-      others,
-    );
-
-    const totalDailyMg = getTotalDailyMgIfDailyKgRule(
-      primary.extracted_json,
-      body.weight_kg,
-    );
-    if (
-      totalDailyMg !== null &&
-      calc.suggested_next_dose_mg !== null &&
-      calc.suggested_next_dose_mg > totalDailyMg
-    ) {
-      return json(200, {
-        status: "BLOCK",
-        message: "Model returned daily dose as per-dose.",
-        suggested_next_dose_mg: null,
-        interval_hours: null,
-        next_eligible_time: null,
-        patient_specific_notes: null,
-        ai_summary: "No monograph data available.",
-      });
-    }
+    const calc = await computeFromMonograph(body, body.extracted_json);
 
     if (
       calc.interval_hours !== null &&
@@ -394,7 +284,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       });
     }
 
-    const maxDailyMg = extractMaxDailyMg(primary.extracted_json);
+    const maxDailyMg = extractMaxDailyMg(body.extracted_json);
     if (
       maxDailyMg !== null &&
       calc.suggested_next_dose_mg !== null &&

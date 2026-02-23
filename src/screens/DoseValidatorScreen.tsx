@@ -54,12 +54,6 @@ type FormValues = {
   notes?: string;
 };
 
-type PmCacheCandidate = {
-  drug_code: string | null;
-  pm_date: string | null;
-  updated_at: string | null;
-};
-
 type PmCounts = { ok: number; noPdf: number; fail: number; total: number };
 
 const defaultFormValues: FormValues = {
@@ -141,8 +135,11 @@ export default function DoseValidatorScreen() {
   const [selectedDrug, setSelectedDrug] = useState<BrandSuggestion | null>(
     null,
   );
-  const [selectedDrugCode, setSelectedDrugCode] = useState<string | null>(null);
-  const [selectedDrugCodes, setSelectedDrugCodes] = useState<string[]>([]);
+  const [, setSelectedDrugCode] = useState<string | null>(null);
+  const [, setSelectedDrugCodes] = useState<string[]>([]);
+  const [selectedExtractedJson, setSelectedExtractedJson] = useState<any | null>(
+    null,
+  );
   const [pmCacheStatus, setPmCacheStatus] = useState<
     "idle" | "loading" | "ok" | "no_pdf" | "fail"
   >("idle");
@@ -242,8 +239,6 @@ export default function DoseValidatorScreen() {
   };
 
   const onSelectSuggestion = async (item: BrandSuggestion) => {
-    const MAX_PREFETCH_TRIES = 20;
-
     setValue("drugName", item.brand_name ?? "", { shouldDirty: true });
     setDrugQuery(item.brand_name ?? "");
     setSuggestions([]);
@@ -253,6 +248,7 @@ export default function DoseValidatorScreen() {
     setSelectedDrug(item);
     setSelectedDrugCode(item.drug_code ?? null);
     setSelectedDrugCodes([]);
+    setSelectedExtractedJson(null);
     Keyboard.dismiss();
 
     const fallbackCode = item.drug_code ?? null;
@@ -262,74 +258,76 @@ export default function DoseValidatorScreen() {
       return;
     }
 
-    let codes: string[] = [fallbackCode];
     const brandName = (item.brand_name ?? "").trim();
-    if (brandName) {
-      const { data: variantRows, error: variantError } = await supabase
-        .from("dpd_drug_product_all")
-        .select("drug_code")
-        .ilike("brand_name", brandName)
-        .limit(20);
-
-      if (!variantError && variantRows) {
-        const dedup = new Set<string>();
-        for (const row of variantRows) {
-          const code = String(row.drug_code ?? "").trim();
-          if (!code) continue;
-          dedup.add(code);
-        }
-        if (dedup.size > 0) {
-          codes = Array.from(dedup);
-        }
-      }
-    }
-    // ensure fallback is first
-    codes = [fallbackCode, ...codes.filter((c) => c !== fallbackCode)];
-    // only try a few
-    codes = codes.slice(0, MAX_PREFETCH_TRIES);
+    const codes: string[] = [fallbackCode];
     setSelectedDrugCodes(codes);
     setPmCacheStatus("loading");
     setPmCacheMessage("Prefetching monographs...");
-    setPmCounts({ ok: 0, noPdf: 0, fail: 0, total: codes.length });
+    setPmCounts({ ok: 0, noPdf: 0, fail: 0, total: 1 });
 
-    supabase.functions
-      .invoke("pm_prefetch", {
-        body: { drug_codes: codes },
-      })
-      .then(({ data, error }) => {
-        if (error) {
-          setPmCounts({ ok: 0, noPdf: 0, fail: 1, total: 1 });
+    try {
+      const resolver = await supabase.functions.invoke("pm_resolver", {
+        body: { drug_name: brandName || item.brand_name || "" },
+      });
+
+      if (resolver.error) {
+        setPmCacheStatus("fail");
+        setPmCacheMessage("Monographs (0/1)");
+        return;
+      }
+
+      const status = String(resolver.data?.status ?? "").toUpperCase();
+      if (status === "READY" && resolver.data?.extracted_json) {
+        setSelectedExtractedJson(resolver.data.extracted_json);
+        if (Array.isArray(resolver.data?.drug_codes)) {
+          setSelectedDrugCodes(
+            resolver.data.drug_codes
+              .map((c: unknown) => String(c ?? "").trim())
+              .filter(Boolean),
+          );
+        }
+        setPmCounts({ ok: 1, noPdf: 0, fail: 0, total: 1 });
+        setPmCacheStatus("ok");
+        setPmCacheMessage("Monographs (1/1)");
+        return;
+      }
+
+      if (status === "NEEDS_PREFETCH") {
+        const codeToFetch = String(resolver.data?.drug_code ?? fallbackCode).trim();
+        if (!codeToFetch) {
           setPmCacheStatus("fail");
           setPmCacheMessage("Monographs (0/1)");
           return;
         }
 
-        const st = String(data?.details?.[0]?.status ?? data?.status ?? "").toUpperCase();
-        const ok = st === "OK" ? 1 : 0;
-        const noPdf = st === "NO_PDF" ? 1 : 0;
-        const fail = ok === 0 && noPdf === 0 ? 1 : 0;
-        const totalTried = Number(data?.total_tried ?? 1);
-        setPmCounts({ ok, noPdf, fail, total: totalTried });
-        setPmCacheMessage(`Monographs (${ok}/${totalTried})`);
+        setSelectedDrugCode(codeToFetch);
+        const prefetch = await supabase.functions.invoke("pm_prefetch", {
+          body: { drug_code: codeToFetch },
+        });
 
-        const firstOk = Array.isArray(data?.details)
-          ? (data.details as { drug_code?: string; status?: string }[]).find(
-              (d) => String(d.status ?? "").toUpperCase() === "OK",
-            )
-          : null;
-        if (firstOk?.drug_code) {
-          setSelectedDrugCode(String(firstOk.drug_code));
+        if (prefetch.error) {
+          setPmCacheStatus("fail");
+          setPmCacheMessage("Monographs (0/1)");
+          return;
         }
 
-        if (ok > 0) setPmCacheStatus("ok");
-        else if (noPdf > 0 && fail === 0) setPmCacheStatus("no_pdf");
-        else setPmCacheStatus("fail");
-      })
-      .catch(() => {
-        setPmCounts({ ok: 0, noPdf: 0, fail: 1, total: 1 });
-        setPmCacheStatus("fail");
-        setPmCacheMessage("Monographs (0/1)");
-      });
+        if (String(prefetch.data?.status ?? "").toUpperCase() === "OK" && prefetch.data?.extracted_json) {
+          setSelectedExtractedJson(prefetch.data.extracted_json);
+          setPmCounts({ ok: 1, noPdf: 0, fail: 0, total: 1 });
+          setPmCacheStatus("ok");
+          setPmCacheMessage("Monographs (1/1)");
+          return;
+        }
+      }
+
+      setPmCounts({ ok: 0, noPdf: 1, fail: 0, total: 1 });
+      setPmCacheStatus("no_pdf");
+      setPmCacheMessage("Monographs (0/1)");
+    } catch {
+      setPmCounts({ ok: 0, noPdf: 0, fail: 1, total: 1 });
+      setPmCacheStatus("fail");
+      setPmCacheMessage("Monographs (0/1)");
+    }
   };
 
   const onSubmit = async (values: FormValues) => {
@@ -337,22 +335,13 @@ export default function DoseValidatorScreen() {
     setPatientSpecificNotes(null);
     setAiLoading(true);
 
-    let chosenDrugCode = selectedDrugCode;
-    if (selectedDrugCodes.length > 0) {
-      const { data: cacheRows } = await supabase
-        .from("dpd_pm_cache")
-        .select("drug_code, cache_status, pm_date, updated_at")
-        .in("drug_code", selectedDrugCodes)
-        .eq("cache_status", "OK");
-
-      if ((cacheRows?.length ?? 0) > 0) {
-        const sorted = [...(cacheRows as PmCacheCandidate[])].sort((a, b) => {
-          const aDate = Date.parse(String(a.pm_date ?? a.updated_at ?? 0));
-          const bDate = Date.parse(String(b.pm_date ?? b.updated_at ?? 0));
-          return bDate - aDate;
-        });
-        chosenDrugCode = String(sorted[0]?.drug_code ?? chosenDrugCode ?? "");
-      }
+    if (!selectedExtractedJson) {
+      setAiLoading(false);
+      setSnack({
+        visible: true,
+        text: "Monograph not ready. Select a drug and wait for prefetch.",
+      });
+      return;
     }
 
     const { data, error: invokeError } = await supabase.functions.invoke("dose_ai", {
@@ -361,8 +350,7 @@ export default function DoseValidatorScreen() {
         weight_kg: values.weightKg ? Number(values.weightKg) : null,
         age_years: values.ageYears ? Number(values.ageYears) : null,
         gender: values.gender ?? null,
-        drug_codes: selectedDrugCodes,
-        drug_code: chosenDrugCode ?? null,
+        extracted_json: selectedExtractedJson,
         drug_name: values.drugName ?? "",
         last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
         last_dose_time: lastTakenDate?.toISOString() ?? null,
@@ -573,6 +561,7 @@ export default function DoseValidatorScreen() {
                     setSelectedDrug(null);
                     setSelectedDrugCode(null);
                     setSelectedDrugCodes([]);
+                    setSelectedExtractedJson(null);
                     setPmCacheStatus("idle");
                     setPmCacheMessage(null);
                     setPmCounts({ ok: 0, noPdf: 0, fail: 0, total: 0 });

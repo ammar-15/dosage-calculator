@@ -101,8 +101,55 @@ function parseJsonFromResponsesPayload(data: any): unknown {
 async function openaiExtractPdfToJson(pmUrl: string) {
   const prompt = `
 You are extracting dosing-relevant information from a Canadian Product Monograph (PDF).
+GOAL:
+1) Do section-first extraction from rule-heavy zones.
+2) Convert to normalized IF -> THEN rules with confidence.
+3) Preserve short source excerpts with page refs (auditability).
 
-Return STRICT JSON ONLY with this schema:
+SECTION-FIRST RULE:
+Only trust content under these headings (or close variants):
+- INDICATIONS / CLINICAL USE
+- CONTRAINDICATIONS
+- WARNINGS / PRECAUTIONS
+- DOSAGE AND ADMINISTRATION
+- PEDIATRICS / GERIATRICS / RENAL IMPAIRMENT (special populations)
+- ADMINISTRATION / RECONSTITUTION / INFUSION
+- ADVERSE REACTIONS / DRUG INTERACTIONS
+
+HEADING DETECTION:
+Treat headings as lines that look like section headers, using variants.
+Assign each paragraph to the most recent heading.
+
+RULE CONVERSION:
+Convert sentences into IF -> THEN rules using trigger phrases.
+
+Indications triggers:
+"indicated for", "used in", "for the treatment of", "therapy of", "suggested for"
+Contra triggers:
+"contraindicated", "should not be used", "must not be used", "avoid"
+Dosing triggers:
+dose patterns (mg/kg, mg), frequency (q6h, every 6 hours), duration, route, infusion time/rate
+Route triggers:
+"must be given orally", "not effective by the oral route", "should never be given intramuscularly"
+Monitoring triggers:
+"monitor", "serum levels", "renal function", "ototoxicity", "nephrotoxicity", "adjust dose"
+
+NORMALIZATION:
+- Normalize headings (e.g., DOSAGE & ADMINISTRATION -> DOSING; WARNINGS AND PRECAUTIONS -> WARNINGS).
+- Normalize routes (intravenous|IV|i.v. -> IV; oral|PO|by mouth -> PO).
+- Normalize common pathogens/conditions where explicitly stated (e.g., MRSA, C. difficile).
+
+CONFIDENCE:
+HIGH: "contraindicated", "should never", "must be given", "not effective"
+MED: "recommended", "should be used", "usual dose"
+LOW: "may", "suggested", "advisable"
+
+OUTPUT:
+Return STRICT JSON ONLY matching this schema.
+Do not invent clinical guidance. If unsure, omit the rule.
+
+SCHEMA:
+
 {
   "meta": {
     "drug_name": string|null,
@@ -111,6 +158,7 @@ Return STRICT JSON ONLY with this schema:
     "source": "dpd_pm_pdf",
     "source_pages": number|null
   },
+
   "sections": [
     {
       "heading_raw": string,
@@ -119,33 +167,41 @@ Return STRICT JSON ONLY with this schema:
       "page_refs": number[]
     }
   ],
+
   "normalization": {
     "heading_map": [{"from": string, "to": string}],
     "route_map": [{"from": string, "to": "IV"|"PO"|"IM"|"SC"|"INHALATION"|"TOPICAL"|"OTHER"}],
     "condition_map": [{"from": string, "to": string}]
   },
+
   "rules": [
     {
       "rule_type": "INDICATION"|"CONTRAINDICATION"|"DOSING"|"ROUTE"|"MONITORING"|"INTERACTION"|"ADVERSE_REACTION",
       "confidence": "HIGH"|"MED"|"LOW",
+
       "if": {
         "population": string|null,
         "age_min_years": number|null,
         "age_max_years": number|null,
         "weight_min_kg": number|null,
         "weight_max_kg": number|null,
+
         "indication_text": string|null,
         "pathogen_text": string|null,
         "condition_text": string|null,
+
         "route": "IV"|"PO"|"IM"|"SC"|"INTRATHECAL"|"OTHER"|null,
         "renal_impairment": "none"|"mild"|"moderate"|"severe"|null,
         "hepatic_impairment": "none"|"mild"|"moderate"|"severe"|null,
+
         "contra_flag": string|null,
         "interaction_text": string|null
       },
+
       "then": {
         "allow": boolean|null,
         "block": boolean|null,
+
         "dose": {
           "amount": number|null,
           "unit": "mg"|"g"|null,
@@ -153,26 +209,32 @@ Return STRICT JSON ONLY with this schema:
           "per_day": boolean|null,
           "divided_doses": number|null
         },
+
         "frequency": {
           "interval_hours": number|null,
           "frequency_text": string|null
         },
+
         "duration": {
           "amount": number|null,
           "unit": "days"|"weeks"|null,
           "text": string|null
         },
+
         "administration": {
           "infusion_minutes": number|null,
           "max_rate_mg_per_min": number|null,
           "dilution_text": string|null
         },
+
         "monitoring": {
           "required": boolean|null,
           "items": string[]
         },
+
         "notes": string|null
       },
+
       "source": {
         "page_refs": number[],
         "excerpts": string[]
@@ -180,7 +242,9 @@ Return STRICT JSON ONLY with this schema:
     }
   ]
 }
-Return JSON only. No markdown, no code fences, no commentary.
+
+Also include a compact audit trail in sections and rule.source.excerpts (short snippets).
+Output JSON only.
 `;
 
   const resp = await fetch("https://api.openai.com/v1/responses", {

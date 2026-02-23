@@ -60,12 +60,7 @@ type PmCacheCandidate = {
   updated_at: string | null;
 };
 
-type PmCounts = {
-  ok: number;
-  noPdf: number;
-  fail: number;
-  total: number;
-};
+type PmCounts = { ok: number; noPdf: number; fail: number; total: number };
 
 const defaultFormValues: FormValues = {
   patientName: "",
@@ -102,21 +97,6 @@ function formatIsoOrDash(value: string | null): string {
     hour: "numeric",
     minute: "2-digit",
   });
-}
-
-async function runWithConcurrency<T>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<void>,
-) {
-  const queue = [...items];
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (queue.length) {
-      const item = queue.shift()!;
-      await fn(item);
-    }
-  });
-  await Promise.all(workers);
 }
 
 export default function DoseValidatorScreen() {
@@ -167,7 +147,7 @@ export default function DoseValidatorScreen() {
     "idle" | "loading" | "ok" | "no_pdf" | "fail"
   >("idle");
   const [pmCacheMessage, setPmCacheMessage] = useState<string | null>(null);
-  const [pmCounts, setPmCounts] = useState<PmCounts>({
+  const [, setPmCounts] = useState<PmCounts>({
     ok: 0,
     noPdf: 0,
     fail: 0,
@@ -261,40 +241,6 @@ export default function DoseValidatorScreen() {
     setShowDatePicker(true);
   };
 
-  const prefetchAllCodes = async (codes: string[]) => {
-    const baseCounts: PmCounts = { ok: 0, noPdf: 0, fail: 0, total: codes.length };
-    setPmCounts(baseCounts);
-    setPmCacheStatus("loading");
-    setPmCacheMessage(`Prefetching monographs... 0/${codes.length}`);
-
-    let localCounts: PmCounts = { ...baseCounts };
-    await runWithConcurrency(codes, 3, async (code) => {
-      try {
-        const { data, error } = await supabase.functions.invoke("pm_prefetch", {
-          body: { drug_code: code },
-        });
-        if (error) throw error;
-
-        const status = String(data?.status ?? "ERROR").toUpperCase();
-        if (status === "OK") localCounts.ok += 1;
-        else if (status === "NO_PDF") localCounts.noPdf += 1;
-        else localCounts.fail += 1;
-      } catch {
-        localCounts.fail += 1;
-      }
-
-      const done = localCounts.ok + localCounts.noPdf + localCounts.fail;
-      setPmCounts({ ...localCounts });
-      setPmCacheMessage(
-        `Monographs: OK ${localCounts.ok}/${localCounts.total} • NO_PDF ${localCounts.noPdf} • FAIL ${localCounts.fail} (done ${done}/${localCounts.total})`,
-      );
-    });
-
-    if (localCounts.ok > 0) setPmCacheStatus("ok");
-    else if (localCounts.noPdf > 0 && localCounts.fail === 0) setPmCacheStatus("no_pdf");
-    else setPmCacheStatus("fail");
-  };
-
   const onSelectSuggestion = async (item: BrandSuggestion) => {
     const MAX_PREFETCH_TRIES = 5; // try 3–7; 5 is a sweet spot
 
@@ -343,26 +289,40 @@ export default function DoseValidatorScreen() {
     codes = codes.slice(0, MAX_PREFETCH_TRIES);
     setSelectedDrugCodes(codes);
 
-    await prefetchAllCodes(codes);
+    setPmCacheStatus("loading");
+    setPmCacheMessage(`Prefetching monographs... 0/${codes.length}`);
 
-    const { data: okRows } = await supabase
-      .from("dpd_pm_cache")
-      .select("drug_code, cache_status, pm_date, updated_at")
-      .in("drug_code", codes)
-      .eq("cache_status", "OK");
+    const { data, error } = await supabase.functions.invoke("pm_prefetch", {
+      body: { drug_codes: codes },
+    });
 
-    if ((okRows?.length ?? 0) > 0) {
-      const sorted = [...(okRows as PmCacheCandidate[])].sort((a, b) => {
-        const aDate = Date.parse(String(a.pm_date ?? a.updated_at ?? 0));
-        const bDate = Date.parse(String(b.pm_date ?? b.updated_at ?? 0));
-        return bDate - aDate;
-      });
-      setSelectedDrugCode(String(sorted[0]?.drug_code ?? fallbackCode));
-    } else if (pmCounts.noPdf === codes.length) {
-      setPmCacheMessage("No Product Monograph available for this drug in DPD.");
-    } else {
-      setPmCacheMessage("Monograph prefetch failed.");
+    if (error) {
+      setPmCounts({ ok: 0, noPdf: 0, fail: codes.length, total: codes.length });
+      setPmCacheStatus("fail");
+      setPmCacheMessage(`Monograph prefetch failed (${codes.length}). ${error.message}`);
+      return;
     }
+
+    const ok = Number(data?.ok ?? 0);
+    const noPdf = Number(data?.no_pdf ?? 0);
+    const fail = Number(data?.fail ?? 0);
+    const total = Number(data?.total ?? codes.length);
+    setPmCounts({ ok, noPdf, fail, total });
+    setPmCacheMessage(
+      `Monographs: OK ${ok}/${total} • NO_PDF ${noPdf} • FAIL ${fail} (done ${total}/${total})`,
+    );
+
+    const details = Array.isArray(data?.details)
+      ? (data.details as { drug_code?: string; status?: string }[])
+      : [];
+    const firstOk = details.find((d) => String(d.status ?? "").toUpperCase() === "OK");
+    if (firstOk?.drug_code) {
+      setSelectedDrugCode(String(firstOk.drug_code));
+    }
+
+    if (ok > 0) setPmCacheStatus("ok");
+    else if (noPdf > 0 && fail === 0) setPmCacheStatus("no_pdf");
+    else setPmCacheStatus("fail");
   };
 
   const onSubmit = async (values: FormValues) => {
@@ -388,23 +348,20 @@ export default function DoseValidatorScreen() {
       }
     }
 
-    const { data, error: invokeError } = await supabase.functions.invoke(
-      "dose_ai",
-      {
-        body: {
-          patient_name: values.patientName,
-          weight_kg: values.weightKg ? Number(values.weightKg) : null,
+    const { data, error: invokeError } = await supabase.functions.invoke("dose_ai", {
+      body: {
+        patient_name: values.patientName,
+        weight_kg: values.weightKg ? Number(values.weightKg) : null,
         age_years: values.ageYears ? Number(values.ageYears) : null,
         gender: values.gender ?? null,
         drug_codes: selectedDrugCodes,
         drug_code: chosenDrugCode ?? null,
         drug_name: values.drugName ?? "",
-          last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
-          last_dose_time: lastTakenDate?.toISOString() ?? null,
-          patient_notes: values.notes ?? null,
-        },
+        last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
+        last_dose_time: lastTakenDate?.toISOString() ?? null,
+        patient_notes: values.notes ?? null,
       },
-    );
+    });
 
     setAiLoading(false);
 

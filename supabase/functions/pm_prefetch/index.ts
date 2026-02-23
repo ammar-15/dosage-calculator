@@ -1,9 +1,18 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-type PrefetchReq = { drug_code?: string | null };
+type PrefetchReq = {
+  drug_code?: string | null;
+  drug_codes?: string[] | null;
+};
 
 type CacheStatus = "PENDING" | "FETCHING" | "OK" | "NO_PDF" | "FAIL";
+
+type PrefetchDetail = {
+  drug_code: string;
+  status: "OK" | "NO_PDF" | "FAIL";
+  error?: string;
+};
 
 function getEnv(name: string): string {
   const denoVal = (globalThis as any)?.Deno?.env?.get?.(name);
@@ -19,10 +28,15 @@ const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
 
 const sb = createClient(SUPABASE_URL, SERVICE_KEY);
 
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
 function json(status: number, body: unknown) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...corsHeaders },
   });
 }
 
@@ -150,24 +164,22 @@ Rules:
   }
 }
 
-export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> }) {
-  let drugCode = "";
+async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
   try {
-    const body = (await req.json().catch(() => ({}))) as PrefetchReq;
-    drugCode = (body.drug_code ?? "").toString().trim();
-    if (!drugCode) return json(400, { status: "ERROR", message: "drug_code is required" });
-
     const { data: srcRow, error: srcErr } = await sb
       .from("dpd_drug_product_all")
       .select("drug_code, brand_name, din, pm_pdf_url, pm_date")
       .eq("drug_code", drugCode)
       .maybeSingle();
 
-    if (srcErr) return json(500, { status: "ERROR", message: srcErr.message });
-    if (!srcRow) return json(404, { status: "ERROR", message: "drug_code not found" });
+    if (srcErr) {
+      return { drug_code: drugCode, status: "FAIL", error: srcErr.message };
+    }
+    if (!srcRow) {
+      return { drug_code: drugCode, status: "FAIL", error: "drug_code not found" };
+    }
 
     const pmUrl = (srcRow.pm_pdf_url ?? "").toString().trim();
-
     await sb.from("dpd_pm_cache").upsert(
       {
         drug_code: drugCode,
@@ -190,11 +202,7 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
           updated_at: new Date().toISOString(),
         })
         .eq("drug_code", drugCode);
-
-      return json(200, {
-        status: "NO_PDF",
-        message: "No Product Monograph exists in DPD for this product.",
-      });
+      return { drug_code: drugCode, status: "NO_PDF" };
     }
 
     const { data: cacheRow } = await sb
@@ -230,12 +238,10 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
           updated_at: new Date().toISOString(),
         })
         .eq("drug_code", drugCode);
-
-      return json(200, { status: "OK", message: "Cache already up-to-date." });
+      return { drug_code: drugCode, status: "OK" };
     }
 
     const extracted = await openaiExtractPdfToJson(pmUrl);
-
     await sb
       .from("dpd_pm_cache")
       .update({
@@ -249,19 +255,54 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
       })
       .eq("drug_code", drugCode);
 
-    return json(200, { status: "OK", message: "Monograph cached.", drug_code: drugCode });
+    return { drug_code: drugCode, status: "OK" };
   } catch (e) {
     const msg = e instanceof Error ? e.message : "unknown error";
-    if (drugCode) {
-      await sb
-        .from("dpd_pm_cache")
-        .update({
-          cache_status: "FAIL" as CacheStatus,
-          cache_error: msg,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("drug_code", drugCode);
+    await sb
+      .from("dpd_pm_cache")
+      .update({
+        cache_status: "FAIL" as CacheStatus,
+        cache_error: msg,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("drug_code", drugCode);
+    return { drug_code: drugCode, status: "FAIL", error: msg };
+  }
+}
+
+export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> }) {
+  try {
+    const body = (await req.json().catch(() => ({}))) as PrefetchReq;
+    const codes =
+      Array.isArray(body.drug_codes) && body.drug_codes.length
+        ? body.drug_codes.map((c) => String(c).trim()).filter(Boolean)
+        : [(body.drug_code ?? "").toString().trim()].filter(Boolean);
+
+    if (!codes.length) {
+      return json(400, { status: "ERROR", message: "drug_code(s) required" });
     }
+
+    const details: PrefetchDetail[] = [];
+    for (const code of codes) {
+      const detail = await prefetchOne(code);
+      details.push(detail);
+    }
+
+    const ok = details.filter((d) => d.status === "OK").length;
+    const noPdf = details.filter((d) => d.status === "NO_PDF").length;
+    const fail = details.filter((d) => d.status === "FAIL").length;
+
+    return json(200, {
+      status: "OK",
+      message: "Prefetch complete",
+      total: codes.length,
+      ok,
+      no_pdf: noPdf,
+      fail,
+      details,
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "unknown error";
     return json(500, { status: "ERROR", message: msg });
   }
 }
@@ -269,6 +310,8 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
 export default pmPrefetchHandler;
 
 serve((req) => {
-  if (req.method === "OPTIONS") return new Response("ok", { status: 200 });
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { status: 200, headers: corsHeaders });
+  }
   return pmPrefetchHandler({ json: () => req.json() });
 });

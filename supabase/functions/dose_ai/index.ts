@@ -67,6 +67,30 @@ function safeTime(s: string | null): number {
   return Number.isFinite(t) ? t : 0;
 }
 
+function getTotalDailyMgIfDailyKgRule(
+  extractedJson: unknown,
+  weightKgRaw: number | string | null | undefined,
+): number | null {
+  const weightKg = asNumber(weightKgRaw);
+  if (!weightKg || weightKg <= 0) return null;
+
+  const haystack = JSON.stringify((extractedJson as any)?.recommended_dosing ?? extractedJson);
+  const lower = haystack.toLowerCase();
+  const impliesDaily =
+    lower.includes("mg/kg/day") ||
+    lower.includes("mg/kg per day") ||
+    lower.includes("divided doses") ||
+    lower.includes("divided dose");
+  if (!impliesDaily) return null;
+
+  const mgPerKgMatch = lower.match(/(\d+(?:\.\d+)?)\s*mg\s*\/\s*kg(?:\s*\/\s*day|\s*per\s*day)?/);
+  if (!mgPerKgMatch) return null;
+  const mgPerKg = Number(mgPerKgMatch[1]);
+  if (!Number.isFinite(mgPerKg) || mgPerKg <= 0) return null;
+
+  return mgPerKg * weightKg;
+}
+
 async function computeFromMonograph(
   body: DoseReq,
   primaryExtractedJson: unknown,
@@ -247,6 +271,26 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       primary.extracted_json,
       others,
     );
+
+    const totalDailyMg = getTotalDailyMgIfDailyKgRule(
+      primary.extracted_json,
+      body.weight_kg,
+    );
+    if (
+      totalDailyMg !== null &&
+      calc.suggested_next_dose_mg !== null &&
+      calc.suggested_next_dose_mg > totalDailyMg
+    ) {
+      return json(200, {
+        status: "BLOCK",
+        message: "Model returned daily dose as per-dose.",
+        suggested_next_dose_mg: null,
+        interval_hours: null,
+        next_eligible_time: null,
+        patient_specific_notes: null,
+        ai_summary: "No monograph data available.",
+      });
+    }
 
     return json(200, {
       status: calc.status,

@@ -166,6 +166,17 @@ Rules:
 
 async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
   try {
+    const { data: existing } = await sb
+      .from("dpd_pm_cache")
+      .select("cache_status, source_hash, extracted_json, pm_pdf_url, pm_date, updated_at")
+      .eq("drug_code", drugCode)
+      .maybeSingle();
+
+    // If already cached and usable, skip immediately.
+    if (existing?.cache_status === "OK" && existing?.extracted_json) {
+      return { drug_code: drugCode, status: "OK" };
+    }
+
     const { data: srcRow, error: srcErr } = await sb
       .from("dpd_drug_product_all")
       .select("drug_code, brand_name, din, pm_pdf_url, pm_date")
@@ -282,8 +293,32 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
       return json(400, { status: "ERROR", message: "drug_code(s) required" });
     }
 
+    // Expand to all variants by brand_name (if we have at least 1 code)
+    const seed = codes[0];
+    const { data: seedRow } = await sb
+      .from("dpd_drug_product_all")
+      .select("brand_name")
+      .eq("drug_code", seed)
+      .maybeSingle();
+
+    if (seedRow?.brand_name) {
+      const { data: variantRows } = await sb
+        .from("dpd_drug_product_all")
+        .select("drug_code")
+        .eq("brand_name", seedRow.brand_name);
+
+      const variantCodes = (variantRows ?? [])
+        .map((r: { drug_code?: string | null }) => String(r.drug_code ?? "").trim())
+        .filter(Boolean);
+
+      codes.push(...variantCodes);
+    }
+
+    // de-dupe
+    const uniqueCodes = Array.from(new Set(codes));
+
     const details: PrefetchDetail[] = [];
-    for (const code of codes) {
+    for (const code of uniqueCodes) {
       const detail = await prefetchOne(code);
       details.push(detail);
     }
@@ -295,7 +330,7 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
     return json(200, {
       status: "OK",
       message: "Prefetch complete",
-      total: codes.length,
+      total: uniqueCodes.length,
       ok,
       no_pdf: noPdf,
       fail,

@@ -238,6 +238,19 @@ export default function DoseValidatorScreen() {
     setShowDatePicker(true);
   };
 
+  async function fetchDrugCodesForBrand(brandName: string): Promise<string[]> {
+    const { data, error } = await supabase
+      .from("dpd_drug_product_all")
+      .select("drug_code")
+      .ilike("brand_name", brandName);
+
+    if (error) throw error;
+
+    return (data ?? [])
+      .map((r: any) => String(r?.drug_code ?? "").trim())
+      .filter(Boolean);
+  }
+
   const onSelectSuggestion = async (item: BrandSuggestion) => {
     setValue("drugName", item.brand_name ?? "", { shouldDirty: true });
     setDrugQuery(item.brand_name ?? "");
@@ -259,15 +272,26 @@ export default function DoseValidatorScreen() {
     }
 
     const brandName = (item.brand_name ?? "").trim();
-    const codes: string[] = [fallbackCode];
+    let codes: string[] = [];
+    try {
+      codes = await fetchDrugCodesForBrand(brandName || item.brand_name || "");
+    } catch {
+      codes = [fallbackCode].filter(Boolean) as string[];
+    }
+
+    if (!codes.length) codes = [fallbackCode].filter(Boolean) as string[];
+
     setSelectedDrugCodes(codes);
     setPmCacheStatus("loading");
     setPmCacheMessage("Prefetching monographs...");
-    setPmCounts({ ok: 0, noPdf: 0, fail: 0, total: 1 });
+    setPmCounts({ ok: 0, noPdf: 0, fail: 0, total: codes.length });
 
     try {
       const resolver = await supabase.functions.invoke("pm_resolver", {
-        body: { drug_name: brandName || item.brand_name || "" },
+        body: {
+          drug_name: brandName || item.brand_name || "",
+          drug_ids: codes,
+        },
       });
 
       if (resolver.error) {

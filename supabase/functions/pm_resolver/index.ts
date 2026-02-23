@@ -31,19 +31,6 @@ function isJsonObject(v: any): boolean {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-function pickMostRecentOk(rows: any[]) {
-  const okRows = rows.filter((r) => isJsonObject(r.extracted_json));
-  if (!okRows.length) return null;
-
-  okRows.sort((a, b) => {
-    const at = Date.parse(String(a?.updated_at ?? a?.parsed_at ?? ""));
-    const bt = Date.parse(String(b?.updated_at ?? b?.parsed_at ?? ""));
-    return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0);
-  });
-
-  return okRows[0];
-}
-
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { status: 200, headers: corsHeaders });
@@ -52,80 +39,75 @@ serve(async (req) => {
   try {
     const body = await req.json().catch(() => ({}));
 
-    // what your frontend should send:
-    // { drug_name: string, drug_ids: string[] }  (or drug_codes)
     const drugName = String(body?.drug_name ?? "").trim();
-    const drugIdsRaw = body?.drug_ids ?? body?.drug_codes ?? [];
-    const drugCodes = Array.isArray(drugIdsRaw)
-      ? drugIdsRaw.map((x: any) => String(x ?? "").trim()).filter(Boolean)
+    const drugIds: string[] = Array.isArray(body?.drug_ids)
+      ? body.drug_ids.map((x: any) => String(x ?? "").trim()).filter(Boolean)
       : [];
 
-    if (!drugName) {
-      return json(400, { status: "ERROR", message: "drug_name required" });
-    }
-    if (!drugCodes.length) {
-      return json(400, {
-        status: "ERROR",
-        message: "drug_ids (drug_codes) required for resolver",
-      });
+    if (!drugName && drugIds.length === 0) {
+      return json(400, { status: "ERROR", message: "drug_name or drug_ids required" });
     }
 
-    // 1) Fast path: check cache for ANY of these drug_codes
-    const { data: cacheRows, error: cacheErr } = await sb
+    const cacheQuery = sb
       .from("dpd_pm_cache")
-      .select("drug_code, extracted_json, pm_pdf_url, cache_status, updated_at, parsed_at")
-      .in("drug_code", drugCodes);
+      .select("drug_code, extracted_json, updated_at")
+      .limit(50);
 
-    if (cacheErr) {
-      return json(500, { status: "ERROR", message: cacheErr.message });
+    const { data: rows, error: rowsErr } =
+      drugIds.length > 0
+        ? await cacheQuery.in("drug_code", drugIds)
+        : await cacheQuery.ilike("brand_name", drugName);
+
+    if (rowsErr) {
+      return json(500, { status: "ERROR", message: rowsErr.message });
     }
 
-    const rows = cacheRows ?? [];
-    const best = pickMostRecentOk(rows);
+    if (!rows || rows.length === 0) {
+      if (drugIds.length > 0) {
+        return json(200, { status: "NEEDS_PREFETCH", drug_code: drugIds[0] ?? null });
+      }
 
-    // If ANY extracted_json exists for these codes, return it (NO PREFETCH)
-    if (best?.extracted_json) {
-      return json(200, {
-        status: "READY",
-        extracted_json: best.extracted_json,
-        drug_codes: drugCodes,
-        used_drug_code: best.drug_code,
-        cache_status: best.cache_status ?? null,
-      });
-    }
-
-    // 2) No extracted_json found -> choose a drug_code to prefetch
-    // Prefer a code that already has pm_pdf_url in cache, otherwise pull from dpd_drug_product_all
-    let candidateCode =
-      rows.find((r) => String(r?.pm_pdf_url ?? "").trim())?.drug_code ?? null;
-
-    if (!candidateCode) {
       const { data: srcRows, error: srcErr } = await sb
         .from("dpd_drug_product_all")
-        .select("drug_code, pm_pdf_url")
-        .in("drug_code", drugCodes);
+        .select("drug_code")
+        .ilike("brand_name", drugName)
+        .limit(20);
 
       if (srcErr) {
         return json(500, { status: "ERROR", message: srcErr.message });
       }
 
-      candidateCode =
-        (srcRows ?? []).find((r) => String(r?.pm_pdf_url ?? "").trim())?.drug_code ??
-        null;
-    }
+      if (!srcRows || srcRows.length === 0) {
+        return json(200, { status: "MISSING", message: "No cache rows found" });
+      }
 
-    if (!candidateCode) {
+      const fallbackCode = String(srcRows[0]?.drug_code ?? "").trim();
       return json(200, {
-        status: "MISSING",
-        message: "No pm_pdf_url available for any drug_code under this drug_name",
-        drug_codes: drugCodes,
+        status: "NEEDS_PREFETCH",
+        drug_code: fallbackCode || null,
       });
     }
 
+    const readyRow = rows
+      .filter((r: any) => isJsonObject(r.extracted_json))
+      .sort((a: any, b: any) => {
+        const at = Date.parse(String(a?.updated_at ?? ""));
+        const bt = Date.parse(String(b?.updated_at ?? ""));
+        return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0);
+      })[0];
+
+    if (readyRow) {
+      return json(200, {
+        status: "READY",
+        extracted_json: readyRow.extracted_json,
+        drug_codes: rows.map((r: any) => r.drug_code),
+      });
+    }
+
+    const missing = rows.find((r: any) => !isJsonObject(r.extracted_json));
     return json(200, {
       status: "NEEDS_PREFETCH",
-      drug_code: candidateCode,
-      drug_codes: drugCodes,
+      drug_code: missing?.drug_code ?? rows[0]?.drug_code ?? null,
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "unknown error";

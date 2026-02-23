@@ -296,7 +296,7 @@ export default function DoseValidatorScreen() {
 
       if (resolver.error) {
         setPmCacheStatus("fail");
-        setPmCacheMessage("Monographs (0/1)");
+        setPmCacheMessage(`Monographs (0/${codes.length})`);
         return;
       }
 
@@ -310,9 +310,9 @@ export default function DoseValidatorScreen() {
               .filter(Boolean),
           );
         }
-        setPmCounts({ ok: 1, noPdf: 0, fail: 0, total: 1 });
+        setPmCounts({ ok: 1, noPdf: 0, fail: 0, total: codes.length });
         setPmCacheStatus("ok");
-        setPmCacheMessage("Monographs (1/1)");
+        setPmCacheMessage(`Monographs (1/${codes.length})`);
         return;
       }
 
@@ -320,7 +320,7 @@ export default function DoseValidatorScreen() {
         const codeToFetch = String(resolver.data?.drug_code ?? fallbackCode).trim();
         if (!codeToFetch) {
           setPmCacheStatus("fail");
-          setPmCacheMessage("Monographs (0/1)");
+          setPmCacheMessage(`Monographs (0/${codes.length})`);
           return;
         }
 
@@ -331,26 +331,26 @@ export default function DoseValidatorScreen() {
 
         if (prefetch.error) {
           setPmCacheStatus("fail");
-          setPmCacheMessage("Monographs (0/1)");
+          setPmCacheMessage(`Monographs (0/${codes.length})`);
           return;
         }
 
         if (String(prefetch.data?.status ?? "").toUpperCase() === "OK" && prefetch.data?.extracted_json) {
           setSelectedExtractedJson(prefetch.data.extracted_json);
-          setPmCounts({ ok: 1, noPdf: 0, fail: 0, total: 1 });
+          setPmCounts({ ok: 1, noPdf: 0, fail: 0, total: codes.length });
           setPmCacheStatus("ok");
-          setPmCacheMessage("Monographs (1/1)");
+          setPmCacheMessage(`Monographs (1/${codes.length})`);
           return;
         }
       }
 
-      setPmCounts({ ok: 0, noPdf: 1, fail: 0, total: 1 });
+      setPmCounts({ ok: 0, noPdf: 1, fail: 0, total: codes.length });
       setPmCacheStatus("no_pdf");
-      setPmCacheMessage("Monographs (0/1)");
+      setPmCacheMessage(`Monographs (0/${codes.length})`);
     } catch {
-      setPmCounts({ ok: 0, noPdf: 0, fail: 1, total: 1 });
+      setPmCounts({ ok: 0, noPdf: 0, fail: 1, total: codes.length });
       setPmCacheStatus("fail");
-      setPmCacheMessage("Monographs (0/1)");
+      setPmCacheMessage(`Monographs (0/${codes.length})`);
     }
   };
 

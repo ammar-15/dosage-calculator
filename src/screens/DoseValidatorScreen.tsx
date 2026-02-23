@@ -767,6 +767,11 @@ export default function DoseValidatorScreen() {
           <Text style={{ color: "rgba(255,255,255,0.85)" }}>
             Next eligible at: {formatIsoOrDash(result?.nextEligibleAt ?? null)}
           </Text>
+          {result?.message ? (
+            <Text style={{ color: "rgba(255,255,255,0.75)" }}>
+              {result.message}
+            </Text>
+          ) : null}
           {patientSpecificNotes ? (
             <Text style={{ color: "rgba(255,255,255,0.85)" }}>
               Patient-specific notes: {patientSpecificNotes}

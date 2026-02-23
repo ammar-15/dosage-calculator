@@ -251,7 +251,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
         interval_hours: null,
         next_eligible_time: null,
         patient_specific_notes: null,
-        ai_summary: "No monograph data available.",
+        ai_summary: gate.message ?? "Input blocked by plausibility gate.",
       });
     }
 
@@ -280,7 +280,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
         interval_hours: null,
         next_eligible_time: null,
         patient_specific_notes: null,
-        ai_summary: "No monograph data available.",
+        ai_summary: "Interval out of plausible range.",
       });
     }
 
@@ -300,7 +300,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
           interval_hours: null,
           next_eligible_time: null,
           patient_specific_notes: null,
-          ai_summary: "No monograph data available.",
+          ai_summary: "Computed regimen exceeds monograph max daily limit.",
         });
       }
     }
@@ -325,7 +325,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       patient_specific_notes: finalPatientNotes,
       ai_summary:
         finalStatus === "BLOCK"
-          ? "No monograph data available."
+          ? calc.message
           : "Dose computed from monograph cache.",
     });
   } catch (e) {

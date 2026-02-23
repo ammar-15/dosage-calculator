@@ -316,43 +316,60 @@ Also include a compact audit trail in sections and rule.source.excerpts (short s
 Output JSON only.
 `;
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4.1-mini",
-      temperature: 0.1,
-      max_output_tokens: 4000,
-      input: [
-        {
-          role: "system",
-          content: [{ type: "input_text", text: prompt }],
-        },
-        {
-          role: "user",
-          content: [
-            { type: "input_file", file_url: pmUrl },
-            { type: "input_text", text: "Extract dosing-relevant JSON from this PDF." },
-          ],
-        },
-      ],
-    }),
-  });
+  const callOpenAi = async (strictJsonOnly: boolean) => {
+    const strictSuffix = strictJsonOnly
+      ? "\n\nCRITICAL: Return JSON only. No markdown, no code fences, no commentary."
+      : "";
+    return fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-mini",
+        temperature: strictJsonOnly ? 0 : 0.1,
+        max_output_tokens: 4000,
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: `${prompt}${strictSuffix}` }],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "input_file", file_url: pmUrl },
+              { type: "input_text", text: "Extract dosing-relevant JSON from this PDF." },
+            ],
+          },
+        ],
+      }),
+    });
+  };
 
-  if (!resp.ok) {
-    const t = await resp.text().catch(() => "");
-    throw new Error(`OpenAI extraction failed: ${resp.status} ${t}`);
-  }
+  const parseResponse = async (resp: Response) => {
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      throw new Error(`OpenAI extraction failed: ${resp.status} ${t}`);
+    }
+    try {
+      const data = await resp.json();
+      return parseJsonFromResponsesPayload(data);
+    } catch {
+      throw new Error("Failed to parse extracted JSON");
+    }
+  };
 
+  const first = await callOpenAi(false);
   try {
-    const data = await resp.json();
-    return parseJsonFromResponsesPayload(data);
-  } catch {
-    throw new Error("Failed to parse extracted JSON");
+    return await parseResponse(first);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "parse failed";
+    if (!msg.toLowerCase().includes("parse")) throw e;
   }
+
+  const retry = await callOpenAi(true);
+  return parseResponse(retry);
 }
 
 async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
@@ -367,7 +384,7 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
     if (
       existing?.cache_status === "OK" &&
       existing?.extracted_json &&
-      Array.isArray((existing.extracted_json as any)?.rules)
+      isUsableExtractedJson(existing.extracted_json)
     ) {
       return { drug_code: drugCode, status: "OK" };
     }
@@ -451,6 +468,14 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       cacheRow?.source_hash &&
       cacheRow.source_hash === hash
     ) {
+      const { data: usableCache } = await sb
+        .from("dpd_pm_cache")
+        .select("extracted_json")
+        .eq("drug_code", drugCode)
+        .maybeSingle();
+      if (!isUsableExtractedJson(usableCache?.extracted_json)) {
+        // force a re-parse if prior cache is hash-equal but unusable
+      } else {
       await sb
         .from("dpd_pm_cache")
         .update({
@@ -460,6 +485,7 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
         })
         .eq("drug_code", drugCode);
       return { drug_code: drugCode, status: "OK" };
+      }
     }
 
     await sb

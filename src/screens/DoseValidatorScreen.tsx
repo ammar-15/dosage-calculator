@@ -37,7 +37,8 @@ const NativeDateTimePicker = (() => {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mod = require("@react-native-community/datetimepicker");
-    return (mod?.default ?? mod) as React.ComponentType<NativeDateTimePickerProps>;
+    return (mod?.default ??
+      mod) as React.ComponentType<NativeDateTimePickerProps>;
   } catch {
     return null;
   }
@@ -51,6 +52,29 @@ type FormValues = {
   drugName?: string;
   lastDoseMg?: string;
   notes?: string;
+};
+
+type PmCacheCandidate = {
+  drug_code: string | null;
+  pm_date: string | null;
+  updated_at: string | null;
+};
+
+type PmCounts = {
+  ok: number;
+  noPdf: number;
+  fail: number;
+  total: number;
+};
+
+const defaultFormValues: FormValues = {
+  patientName: "",
+  weightKg: "",
+  ageYears: "",
+  gender: "other",
+  drugName: "",
+  lastDoseMg: "",
+  notes: "",
 };
 
 function formatLastTaken(date: Date | null): string {
@@ -80,6 +104,21 @@ function formatIsoOrDash(value: string | null): string {
   });
 }
 
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+) {
+  const queue = [...items];
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (queue.length) {
+      const item = queue.shift()!;
+      await fn(item);
+    }
+  });
+  await Promise.all(workers);
+}
+
 export default function DoseValidatorScreen() {
   const {
     control,
@@ -87,17 +126,8 @@ export default function DoseValidatorScreen() {
     formState: { errors, isSubmitting },
     reset,
     setValue,
-    watch,
   } = useForm<FormValues>({
-    defaultValues: {
-      patientName: "",
-      weightKg: "",
-      ageYears: "",
-      gender: "other",
-      drugName: "",
-      lastDoseMg: "",
-      notes: "",
-    },
+    defaultValues: defaultFormValues,
   });
 
   const theme = useTheme();
@@ -117,39 +147,38 @@ export default function DoseValidatorScreen() {
 
   const [result, setResult] = useState<GuardrailsResult | null>(null);
   const [aiSummary, setAiSummary] = useState<string | null>(null);
+  const [patientSpecificNotes, setPatientSpecificNotes] = useState<
+    string | null
+  >(null);
   const [aiLoading, setAiLoading] = useState(false);
 
   const [drugQuery, setDrugQuery] = useState("");
   const [suggestions, setSuggestions] = useState<BrandSuggestion[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
+  const [hasSearchResult, setHasSearchResult] = useState(false);
 
-  const [selectedDrug, setSelectedDrug] = useState<BrandSuggestion | null>(null);
+  const [selectedDrug, setSelectedDrug] = useState<BrandSuggestion | null>(
+    null,
+  );
   const [selectedDrugCode, setSelectedDrugCode] = useState<string | null>(null);
+  const [selectedDrugCodes, setSelectedDrugCodes] = useState<string[]>([]);
+  const [pmCacheStatus, setPmCacheStatus] = useState<
+    "idle" | "loading" | "ok" | "no_pdf" | "fail"
+  >("idle");
+  const [pmCacheMessage, setPmCacheMessage] = useState<string | null>(null);
+  const [pmCounts, setPmCounts] = useState<PmCounts>({
+    ok: 0,
+    noPdf: 0,
+    fail: 0,
+    total: 0,
+  });
 
   const [lastTakenDate, setLastTakenDate] = useState<Date | null>(null);
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [showTimePicker, setShowTimePicker] = useState(false);
 
   const searchRequestRef = useRef(0);
-
-  const liveValues = watch();
-
-  useEffect(() => {
-    // AI must remain submit-only in perceived UX.
-    setAiSummary(null);
-    setAiLoading(false);
-  }, [
-    liveValues.patientName,
-    liveValues.weightKg,
-    liveValues.ageYears,
-    liveValues.gender,
-    liveValues.drugName,
-    liveValues.lastDoseMg,
-    liveValues.notes,
-    lastTakenDate,
-    selectedDrug,
-  ]);
 
   useEffect(() => {
     const q = drugQuery.trim();
@@ -164,11 +193,13 @@ export default function DoseValidatorScreen() {
       setSuggestions([]);
       setShowSuggestions(false);
       setIsSearching(false);
+      setHasSearchResult(false);
       return;
     }
 
     const requestId = ++searchRequestRef.current;
     setIsSearching(true);
+    setHasSearchResult(false);
 
     const timer = setTimeout(async () => {
       try {
@@ -177,10 +208,12 @@ export default function DoseValidatorScreen() {
 
         setSuggestions(rows);
         setShowSuggestions(true);
+        setHasSearchResult(true);
       } catch (e: any) {
         if (requestId !== searchRequestRef.current) return;
         setSuggestions([]);
         setShowSuggestions(true);
+        setHasSearchResult(true);
         setSnack({
           visible: true,
           text: `Search failed: ${e?.message ?? "unknown"}`,
@@ -228,51 +261,177 @@ export default function DoseValidatorScreen() {
     setShowDatePicker(true);
   };
 
-  const onSelectSuggestion = (item: BrandSuggestion) => {
+  const prefetchAllCodes = async (codes: string[]) => {
+    const baseCounts: PmCounts = { ok: 0, noPdf: 0, fail: 0, total: codes.length };
+    setPmCounts(baseCounts);
+    setPmCacheStatus("loading");
+    setPmCacheMessage(`Prefetching monographs... 0/${codes.length}`);
+
+    let localCounts: PmCounts = { ...baseCounts };
+    await runWithConcurrency(codes, 3, async (code) => {
+      try {
+        const { data, error } = await supabase.functions.invoke("pm_prefetch", {
+          body: { drug_code: code },
+        });
+        if (error) throw error;
+
+        const status = String(data?.status ?? "ERROR").toUpperCase();
+        if (status === "OK") localCounts.ok += 1;
+        else if (status === "NO_PDF") localCounts.noPdf += 1;
+        else localCounts.fail += 1;
+      } catch {
+        localCounts.fail += 1;
+      }
+
+      const done = localCounts.ok + localCounts.noPdf + localCounts.fail;
+      setPmCounts({ ...localCounts });
+      setPmCacheMessage(
+        `Monographs: OK ${localCounts.ok}/${localCounts.total} • NO_PDF ${localCounts.noPdf} • FAIL ${localCounts.fail} (done ${done}/${localCounts.total})`,
+      );
+    });
+
+    if (localCounts.ok > 0) setPmCacheStatus("ok");
+    else if (localCounts.noPdf > 0 && localCounts.fail === 0) setPmCacheStatus("no_pdf");
+    else setPmCacheStatus("fail");
+  };
+
+  const onSelectSuggestion = async (item: BrandSuggestion) => {
+    const MAX_PREFETCH_TRIES = 5; // try 3–7; 5 is a sweet spot
+
     setValue("drugName", item.brand_name ?? "", { shouldDirty: true });
     setDrugQuery(item.brand_name ?? "");
     setSuggestions([]);
     setShowSuggestions(false);
+    setHasSearchResult(false);
 
     setSelectedDrug(item);
     setSelectedDrugCode(item.drug_code ?? null);
+    setSelectedDrugCodes([]);
     Keyboard.dismiss();
+
+    const fallbackCode = item.drug_code ?? null;
+    if (!fallbackCode) {
+      setPmCacheStatus("fail");
+      setPmCacheMessage("No drug_code for this selection.");
+      return;
+    }
+
+    let codes: string[] = [fallbackCode];
+    const brandName = (item.brand_name ?? "").trim();
+    if (brandName) {
+      const { data: variantRows, error: variantError } = await supabase
+        .from("dpd_drug_product_all")
+        .select("drug_code")
+        .ilike("brand_name", brandName)
+        .limit(20);
+
+      if (!variantError && variantRows) {
+        const dedup = new Set<string>();
+        for (const row of variantRows) {
+          const code = String(row.drug_code ?? "").trim();
+          if (!code) continue;
+          dedup.add(code);
+        }
+        if (dedup.size > 0) {
+          codes = Array.from(dedup);
+        }
+      }
+    }
+    // ensure fallback is first
+    codes = [fallbackCode, ...codes.filter((c) => c !== fallbackCode)];
+    // only try a few
+    codes = codes.slice(0, MAX_PREFETCH_TRIES);
+    setSelectedDrugCodes(codes);
+
+    await prefetchAllCodes(codes);
+
+    const { data: okRows } = await supabase
+      .from("dpd_pm_cache")
+      .select("drug_code, cache_status, pm_date, updated_at")
+      .in("drug_code", codes)
+      .eq("cache_status", "OK");
+
+    if ((okRows?.length ?? 0) > 0) {
+      const sorted = [...(okRows as PmCacheCandidate[])].sort((a, b) => {
+        const aDate = Date.parse(String(a.pm_date ?? a.updated_at ?? 0));
+        const bDate = Date.parse(String(b.pm_date ?? b.updated_at ?? 0));
+        return bDate - aDate;
+      });
+      setSelectedDrugCode(String(sorted[0]?.drug_code ?? fallbackCode));
+    } else if (pmCounts.noPdf === codes.length) {
+      setPmCacheMessage("No Product Monograph available for this drug in DPD.");
+    } else {
+      setPmCacheMessage("Monograph prefetch failed.");
+    }
   };
 
   const onSubmit = async (values: FormValues) => {
     setAiSummary(null);
+    setPatientSpecificNotes(null);
     setAiLoading(true);
 
-    const { data, error: invokeError } = await supabase.functions.invoke("dose_ai", {
-      body: {
-        patient_name: values.patientName,
-        weight_kg: values.weightKg ? Number(values.weightKg) : null,
+    let chosenDrugCode = selectedDrugCode;
+    if (selectedDrugCodes.length > 0) {
+      const { data: cacheRows } = await supabase
+        .from("dpd_pm_cache")
+        .select("drug_code, cache_status, pm_date, updated_at")
+        .in("drug_code", selectedDrugCodes)
+        .eq("cache_status", "OK");
+
+      if ((cacheRows?.length ?? 0) > 0) {
+        const sorted = [...(cacheRows as PmCacheCandidate[])].sort((a, b) => {
+          const aDate = Date.parse(String(a.pm_date ?? a.updated_at ?? 0));
+          const bDate = Date.parse(String(b.pm_date ?? b.updated_at ?? 0));
+          return bDate - aDate;
+        });
+        chosenDrugCode = String(sorted[0]?.drug_code ?? chosenDrugCode ?? "");
+      }
+    }
+
+    const { data, error: invokeError } = await supabase.functions.invoke(
+      "dose_ai",
+      {
+        body: {
+          patient_name: values.patientName,
+          weight_kg: values.weightKg ? Number(values.weightKg) : null,
         age_years: values.ageYears ? Number(values.ageYears) : null,
         gender: values.gender ?? null,
-        drug_code: selectedDrugCode ?? null,
+        drug_codes: selectedDrugCodes,
+        drug_code: chosenDrugCode ?? null,
         drug_name: values.drugName ?? "",
-        last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
-        last_dose_time: lastTakenDate?.toISOString() ?? null,
-        patient_notes: values.notes ?? null,
+          last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
+          last_dose_time: lastTakenDate?.toISOString() ?? null,
+          patient_notes: values.notes ?? null,
+        },
       },
-    });
+    );
 
     setAiLoading(false);
 
     if (invokeError) {
-      setSnack({ visible: true, text: `AI function error: ${invokeError.message}` });
+      setSnack({
+        visible: true,
+        text: `AI function error: ${invokeError.message}`,
+      });
       return;
     }
 
     const ruleResult: GuardrailsResult = {
       status: (data?.status as GuardrailsResult["status"]) ?? "BLOCK",
-      message: typeof data?.message === "string" ? data.message : "Calculation failed.",
+      message:
+        typeof data?.message === "string"
+          ? data.message
+          : "Calculation failed.",
       suggestedNextDoseMg:
-        typeof data?.suggested_next_dose_mg === "number" ? data.suggested_next_dose_mg : null,
+        typeof data?.suggested_next_dose_mg === "number"
+          ? data.suggested_next_dose_mg
+          : null,
       timeIntervalHours:
         typeof data?.interval_hours === "number" ? data.interval_hours : null,
       nextEligibleAt:
-        typeof data?.next_eligible_time === "string" ? data.next_eligible_time : null,
+        typeof data?.next_eligible_time === "string"
+          ? data.next_eligible_time
+          : null,
       capsApplied: false,
       appliedFormulaType: null,
       blockReasons: [],
@@ -286,6 +445,12 @@ export default function DoseValidatorScreen() {
         ? data.ai_summary
         : "AI explanation unavailable.";
     setAiSummary(aiSummaryValue);
+    const patientSpecificNotesValue =
+      typeof data?.patient_specific_notes === "string" &&
+      data.patient_specific_notes.trim()
+        ? data.patient_specific_notes
+        : null;
+    setPatientSpecificNotes(patientSpecificNotesValue);
 
     if (ruleResult.status === "BLOCK" || ruleResult.status === "STOP") {
       return;
@@ -304,11 +469,23 @@ export default function DoseValidatorScreen() {
       time_interval_hours: ruleResult.timeIntervalHours,
       next_eligible_at: ruleResult.nextEligibleAt,
       ai_summary: aiSummaryValue,
+      patient_specific_notes: patientSpecificNotesValue,
       ai_warnings: null,
       ai_model: null,
     };
 
-    const { error } = await supabase.from("patient_data").insert(payload);
+    let { error } = await supabase.from("patient_data").insert(payload);
+    if (
+      error &&
+      typeof error.message === "string" &&
+      error.message.toLowerCase().includes("patient_specific_notes")
+    ) {
+      const { patient_specific_notes: _omit, ...fallbackPayload } = payload;
+      const fallback = await supabase
+        .from("patient_data")
+        .insert(fallbackPayload);
+      error = fallback.error;
+    }
 
     if (error) {
       setSnack({ visible: true, text: `Supabase error: ${error.message}` });
@@ -321,8 +498,7 @@ export default function DoseValidatorScreen() {
   return (
     <ScrollView
       nestedScrollEnabled
-      scrollEnabled={!showSuggestions}
-      keyboardShouldPersistTaps="handled"
+      keyboardShouldPersistTaps="always"
       contentContainerStyle={{
         paddingHorizontal: 16,
         paddingBottom: 28,
@@ -331,7 +507,10 @@ export default function DoseValidatorScreen() {
         backgroundColor: theme.colors.background,
       }}
     >
-      <Text variant="headlineMedium" style={{ fontWeight: "700", letterSpacing: 0.2 }}>
+      <Text
+        variant="headlineMedium"
+        style={{ fontWeight: "700", letterSpacing: 0.2 }}
+      >
         Dose Validator
       </Text>
       <Text variant="bodyMedium" style={{ color: "rgba(255,255,255,0.7)" }}>
@@ -429,6 +608,11 @@ export default function DoseValidatorScreen() {
                     setDrugQuery(text);
                     setSelectedDrug(null);
                     setSelectedDrugCode(null);
+                    setSelectedDrugCodes([]);
+                    setPmCacheStatus("idle");
+                    setPmCacheMessage(null);
+                    setPmCounts({ ok: 0, noPdf: 0, fail: 0, total: 0 });
+                    setHasSearchResult(false);
                     if (text.trim().length >= 2) {
                       setShowSuggestions(true);
                     } else {
@@ -444,7 +628,11 @@ export default function DoseValidatorScreen() {
                   outlineStyle={{ borderRadius: 16 }}
                   mode="outlined"
                   placeholder="Search Health Canada DPD"
-                  right={isSearching ? <TextInput.Icon icon="progress-clock" /> : undefined}
+                  right={
+                    isSearching ? (
+                      <TextInput.Icon icon="progress-clock" />
+                    ) : undefined
+                  }
                 />
               )}
             />
@@ -469,16 +657,17 @@ export default function DoseValidatorScreen() {
                 {isSearching ? (
                   <View style={{ paddingVertical: 14, paddingHorizontal: 16 }}>
                     <ActivityIndicator size="small" />
-                    <Text style={{ marginTop: 8, color: "rgba(255,255,255,0.78)" }}>
+                    <Text
+                      style={{ marginTop: 8, color: "rgba(255,255,255,0.78)" }}
+                    >
                       Loading suggestions...
                     </Text>
                   </View>
                 ) : suggestions.length > 0 ? (
                   <ScrollView
                     nestedScrollEnabled
-                    keyboardShouldPersistTaps="handled"
+                    keyboardShouldPersistTaps="always"
                     showsVerticalScrollIndicator
-                    onStartShouldSetResponderCapture={() => true}
                     style={{ maxHeight: 240 }}
                   >
                     {suggestions.map((item, index) => (
@@ -489,7 +678,7 @@ export default function DoseValidatorScreen() {
                       />
                     ))}
                   </ScrollView>
-                ) : drugQuery.trim().length >= 2 ? (
+                ) : hasSearchResult ? (
                   <List.Item title="No matches" />
                 ) : null}
               </Surface>
@@ -497,8 +686,22 @@ export default function DoseValidatorScreen() {
           </View>
 
           {selectedDrug ? (
-            <Text variant="bodySmall" style={{ color: "rgba(255,255,255,0.65)" }}>
-              Selected: {selectedDrug.brand_name}
+            <Text
+              variant="bodySmall"
+              style={{ color: "rgba(255,255,255,0.65)" }}
+            >
+              Selected: {selectedDrug.brand_name}{" "}
+              {pmCacheStatus === "loading" ? "• Preparing monograph..." : null}
+              {pmCacheStatus === "ok" ? "• Monograph ready" : null}
+              {pmCacheStatus === "no_pdf" ? "• No monograph" : null}
+            </Text>
+          ) : null}
+          {pmCacheMessage ? (
+            <Text
+              variant="bodySmall"
+              style={{ color: "rgba(255,255,255,0.55)" }}
+            >
+              {pmCacheMessage}
             </Text>
           ) : null}
 
@@ -587,18 +790,27 @@ export default function DoseValidatorScreen() {
           <Text style={{ color: "rgba(255,255,255,0.85)" }}>
             Next eligible at: {formatIsoOrDash(result?.nextEligibleAt ?? null)}
           </Text>
+          {patientSpecificNotes ? (
+            <Text style={{ color: "rgba(255,255,255,0.85)" }}>
+              Patient-specific notes: {patientSpecificNotes}
+            </Text>
+          ) : null}
 
           {aiLoading && (
             <Text style={{ marginTop: 10, color: "rgba(255,255,255,0.85)" }}>
-              Generating AI explanation...
+              Calculating...
             </Text>
           )}
           {aiSummary && (
             <View style={{ marginTop: 12 }}>
-              <Text style={{ fontWeight: "600", color: "rgba(255,255,255,0.92)" }}>
+              <Text
+                style={{ fontWeight: "600", color: "rgba(255,255,255,0.92)" }}
+              >
                 AI Explanation
               </Text>
-              <Text style={{ color: "rgba(255,255,255,0.86)" }}>{aiSummary}</Text>
+              <Text style={{ color: "rgba(255,255,255,0.86)" }}>
+                {aiSummary}
+              </Text>
             </View>
           )}
 
@@ -610,40 +822,36 @@ export default function DoseValidatorScreen() {
         </Card.Content>
       </Card>
 
-      {result ? (
-        <Card style={glassCardStyle}>
-          <Card.Content>
-            <Text style={{ color: "rgba(255,255,255,0.85)" }}>
-              Last run: {result.status} - {result.message}
-            </Text>
-          </Card.Content>
-        </Card>
-      ) : null}
-
       <Button
         mode="contained"
         onPress={handleSubmit(onSubmit)}
         loading={isSubmitting}
-        disabled={isSubmitting}
+        disabled={isSubmitting || pmCacheStatus === "loading"}
       >
-        Validate + Save
+        Calculate
       </Button>
 
       <Button
         mode="text"
         onPress={() => {
-          reset({ gender: "other" });
+          reset(defaultFormValues);
           setResult(null);
           setAiSummary(null);
           setAiLoading(false);
           setSuggestions([]);
           setShowSuggestions(false);
+          setHasSearchResult(false);
           setSelectedDrug(null);
           setSelectedDrugCode(null);
+          setSelectedDrugCodes([]);
+          setPmCacheStatus("idle");
+          setPmCacheMessage(null);
+          setPmCounts({ ok: 0, noPdf: 0, fail: 0, total: 0 });
           setLastTakenDate(null);
           setShowDatePicker(false);
           setShowTimePicker(false);
           setDrugQuery("");
+          setPatientSpecificNotes(null);
         }}
       >
         Reset

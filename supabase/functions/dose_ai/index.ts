@@ -1,136 +1,263 @@
-import { computeFromGuardrails } from "../../../src/lib/guardrailsEngine";
+import { createClient } from "npm:@supabase/supabase-js@2";
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-type Req = {
-  patient_name?: string;
+type DoseReq = {
+  drug_code?: string | null;
+  drug_codes?: string[] | null;
   weight_kg?: number | string | null;
   age_years?: number | string | null;
   gender?: string | null;
-  drug_name?: string | null;
   last_dose_mg?: number | string | null;
   last_dose_time?: string | null;
   patient_notes?: string | null;
 };
 
-type Calc = {
-  status: "OK" | "WARN" | "BLOCK" | "STOP";
+type DoseResp = {
+  status: "OK" | "WARN" | "BLOCK";
   message: string;
   suggested_next_dose_mg: number | null;
   interval_hours: number | null;
   next_eligible_time: string | null;
+  patient_specific_notes: string | null;
 };
 
-function toNum(v: unknown): number | null {
+type CacheRow = {
+  drug_code: string | null;
+  pm_date: string | null;
+  updated_at: string | null;
+  cache_status: string | null;
+  extracted_json: unknown;
+};
+
+function getEnv(name: string): string {
+  const denoVal = (globalThis as any)?.Deno?.env?.get?.(name);
+  if (typeof denoVal === "string" && denoVal) return denoVal;
+  const procVal = (globalThis as any)?.process?.env?.[name];
+  if (typeof procVal === "string" && procVal) return procVal;
+  throw new Error(`Missing env: ${name}`);
+}
+
+const PROJECT_URL = getEnv("PROJECT_URL");
+const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
+const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
+
+const sb = createClient(PROJECT_URL, SERVICE_KEY);
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+function json(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders },
+  });
+}
+
+function asNumber(v: unknown): number | null {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
 
-function computeDose(input: Req): Calc {
-  const rule = computeFromGuardrails({
-    patientName: input.patient_name ?? "",
-    weightKg: toNum(input.weight_kg),
-    ageYears: toNum(input.age_years),
-    gender:
-      input.gender === "male" || input.gender === "female" || input.gender === "other"
-        ? input.gender
-        : null,
-    drugName: input.drug_name ?? "",
-    lastDoseMg: toNum(input.last_dose_mg),
-    lastDoseTakenAt: input.last_dose_time ? new Date(input.last_dose_time) : null,
-    notes: input.patient_notes ?? null,
-    flags: {},
-    symptoms: [],
-  });
-
-  return {
-    status: rule.status,
-    message: rule.message,
-    suggested_next_dose_mg: rule.suggestedNextDoseMg,
-    interval_hours: rule.timeIntervalHours,
-    next_eligible_time: rule.nextEligibleAt,
-  };
+function safeTime(s: string | null): number {
+  if (!s) return 0;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : 0;
 }
 
-async function aiExplain(input: Req, calc: Calc): Promise<string | null> {
-  const apiKey = (globalThis as any)?.process?.env?.OPENAI_API_KEY ?? "";
-  if (!apiKey) return null;
-
+async function computeFromMonograph(
+  body: DoseReq,
+  primaryExtractedJson: unknown,
+  otherVariantMonographs: { drug_code: string; extracted_json: unknown }[],
+): Promise<DoseResp> {
   const prompt = `
-This is a hackathon demo application.
-This is NOT medical advice.
+Hackathon demo. Not medical advice.
 
-You must NOT generate new dose numbers.
-You must NOT modify the provided dose or interval.
-You may only explain the provided calculated result.
+You are given structured dosing-relevant monograph data in JSON plus patient inputs.
+You MUST use ONLY the provided extracted monograph JSON.
+If the monograph does not contain enough info to compute, return BLOCK.
 
-Patient Profile:
-Name: ${input.patient_name ?? ""}
-Weight: ${input.weight_kg ?? ""} kg
-Age: ${input.age_years ?? ""}
-Gender: ${input.gender ?? ""}
+Return STRICT JSON only:
 
-Medication:
-Drug: ${input.drug_name ?? ""}
-Last Dose: ${input.last_dose_mg ?? ""} mg
-Last Dose Time: ${input.last_dose_time ?? ""}
-Indication: ${input.patient_notes ?? ""}
+{
+  "status": "OK"|"WARN"|"BLOCK",
+  "message": string,
+  "suggested_next_dose_mg": number|null,
+  "interval_hours": number|null,
+  "next_eligible_time": string|null,
+  "patient_specific_notes": string|null
+}
 
-Calculated Result:
-Next Dose: ${calc.suggested_next_dose_mg ?? ""} mg
-Interval: ${calc.interval_hours ?? ""} hours
-Next Eligible Time: ${calc.next_eligible_time ?? ""}
+Patient:
+weight_kg=${asNumber(body.weight_kg)}
+age_years=${asNumber(body.age_years)}
+gender=${body.gender ?? null}
+last_dose_mg=${asNumber(body.last_dose_mg)}
+last_dose_time=${body.last_dose_time ?? null}
+notes=${body.patient_notes ?? null}
 
-Explain:
-1. Why this dose is appropriate.
-2. Any standard monitoring considerations.
-3. Any assumptions made.
-End with: "Demo only - not medical advice."
+Primary monograph extracted JSON:
+${JSON.stringify(primaryExtractedJson)}
+
+Other variant monographs:
+${JSON.stringify(otherVariantMonographs)}
 `;
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
+      temperature: 0.1,
       messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
     }),
   });
 
-  if (!response.ok) return null;
-  const data = await response.json();
-  return data?.choices?.[0]?.message?.content ?? null;
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`OpenAI dose calculation failed: ${resp.status} ${t}`);
+  }
+
+  const data = await resp.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== "string" || !content.trim()) {
+    throw new Error("Empty OpenAI response");
+  }
+
+  const firstBrace = content.indexOf("{");
+  const lastBrace = content.lastIndexOf("}");
+  const sliced =
+    firstBrace >= 0 && lastBrace >= 0
+      ? content.slice(firstBrace, lastBrace + 1)
+      : content;
+
+  const parsed = JSON.parse(sliced);
+
+  const status =
+    parsed?.status === "OK" || parsed?.status === "WARN" || parsed?.status === "BLOCK"
+      ? parsed.status
+      : "BLOCK";
+
+  return {
+    status,
+    message: typeof parsed?.message === "string" ? parsed.message : "Unable to compute from monograph.",
+    suggested_next_dose_mg:
+      typeof parsed?.suggested_next_dose_mg === "number"
+        ? parsed.suggested_next_dose_mg
+        : null,
+    interval_hours:
+      typeof parsed?.interval_hours === "number" ? parsed.interval_hours : null,
+    next_eligible_time:
+      typeof parsed?.next_eligible_time === "string" ? parsed.next_eligible_time : null,
+    patient_specific_notes:
+      typeof parsed?.patient_specific_notes === "string"
+        ? parsed.patient_specific_notes
+        : null,
+  };
 }
 
-export async function doseAiHandler(req: { json: () => Promise<Req> }) {
+export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
   try {
     const body = await req.json();
-    const calc = computeDose(body);
+    const codes =
+      Array.isArray(body.drug_codes) && body.drug_codes.length
+        ? body.drug_codes.map(String)
+        : [(body.drug_code ?? "").toString()].filter(Boolean);
 
-    let aiSummary: string | null = null;
-    if (calc.status !== "BLOCK" && calc.status !== "STOP") {
-      aiSummary = await aiExplain(body, calc);
+    if (!codes.length) {
+      return json(200, {
+        status: "BLOCK",
+        message: "drug_code is required",
+        suggested_next_dose_mg: null,
+        interval_hours: null,
+        next_eligible_time: null,
+        patient_specific_notes: null,
+        ai_summary: "No monograph data available.",
+      });
     }
 
-    return new Response(
-      JSON.stringify({
-        status: calc.status,
-        message: calc.message,
-        suggested_next_dose_mg: calc.suggested_next_dose_mg,
-        interval_hours: calc.interval_hours,
-        next_eligible_time: calc.next_eligible_time,
-        ai_summary: aiSummary,
-      }),
-      { headers: { "Content-Type": "application/json" } },
+    const { data: rows, error: cacheErr } = await sb
+      .from("dpd_pm_cache")
+      .select("drug_code, pm_date, updated_at, cache_status, extracted_json")
+      .in("drug_code", codes);
+
+    if (cacheErr) {
+      return json(500, {
+        status: "BLOCK",
+        message: cacheErr.message,
+        suggested_next_dose_mg: null,
+        interval_hours: null,
+        next_eligible_time: null,
+        patient_specific_notes: null,
+        ai_summary: "No monograph data available.",
+      });
+    }
+
+    const okRows = ((rows ?? []) as CacheRow[]).filter(
+      (r) => r.cache_status === "OK" && r.extracted_json,
     );
-  } catch {
-    return new Response(
-      JSON.stringify({ error: "AI explanation failed" }),
-      { status: 500 },
-    );
+
+    if (!okRows.length) {
+      return json(200, {
+        status: "BLOCK",
+        message: "No Product Monograph dosing data available in DPD for this product.",
+        suggested_next_dose_mg: null,
+        interval_hours: null,
+        next_eligible_time: null,
+        patient_specific_notes: null,
+        ai_summary: "No monograph data available.",
+      });
+    }
+
+    okRows.sort((a, b) => {
+      const ad = safeTime(a.pm_date) || safeTime(a.updated_at);
+      const bd = safeTime(b.pm_date) || safeTime(b.updated_at);
+      return bd - ad;
+    });
+
+    const primary = okRows[0];
+    const others = okRows.slice(1).map((r) => ({
+      drug_code: String(r.drug_code),
+      extracted_json: r.extracted_json,
+    }));
+
+    const calc = await computeFromMonograph(body, primary.extracted_json, others);
+
+    return json(200, {
+      status: calc.status,
+      message: calc.message,
+      suggested_next_dose_mg: calc.suggested_next_dose_mg,
+      interval_hours: calc.interval_hours,
+      next_eligible_time: calc.next_eligible_time,
+      patient_specific_notes: calc.patient_specific_notes,
+      ai_summary:
+        calc.status === "BLOCK"
+          ? "No monograph data available."
+          : "Dose computed from monograph cache.",
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "AI dose calculation failed";
+    return json(500, {
+      status: "BLOCK",
+      message: msg,
+      suggested_next_dose_mg: null,
+      interval_hours: null,
+      next_eligible_time: null,
+      patient_specific_notes: null,
+      ai_summary: "AI explanation unavailable.",
+    });
   }
 }
 
 export default doseAiHandler;
+
+serve((req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { status: 200, headers: corsHeaders });
+  }
+  return doseAiHandler({ json: () => req.json() });
+});

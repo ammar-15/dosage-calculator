@@ -3,5 +3,10 @@
     "source.fixAll": "explicit",
     "source.organizeImports": "explicit",
     "source.sortMembers": "explicit"
-  }
+  },
+
+  "deno.enable": true,
+  "deno.unstable": true,
+  "deno.lint": true,
+  "deno.importMap": "./supabase/functions/import_map.json"
 }

@@ -69,35 +69,6 @@ async function fetchWithRetry(url: string, max = 4): Promise<Response> {
   throw lastErr ?? new Error("fetch failed");
 }
 
-function stripCodeFences(s: string): string {
-  return s.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-}
-
-function parseJsonFromResponsesPayload(data: any): unknown {
-  const textParts: string[] = [];
-  if (typeof data?.output_text === "string" && data.output_text.trim()) {
-    textParts.push(data.output_text);
-  }
-
-  for (const item of data?.output ?? []) {
-    for (const content of item?.content ?? []) {
-      if (typeof content?.text === "string" && content.text.trim()) {
-        textParts.push(content.text);
-      }
-    }
-  }
-
-  let combined = stripCodeFences(textParts.join("\n").trim());
-  if (!combined) throw new Error("Empty OpenAI response");
-
-  const firstBrace = combined.indexOf("{");
-  const lastBrace = combined.lastIndexOf("}");
-  if (firstBrace < 0 || lastBrace < 0) throw new Error("No JSON object found");
-
-  combined = combined.slice(firstBrace, lastBrace + 1);
-  return JSON.parse(combined);
-}
-
 async function openaiExtractPdfToJson(pmUrl: string) {
   const prompt = `
 You are extracting dosing-relevant information from a Canadian Product Monograph (PDF).
@@ -254,8 +225,9 @@ Output JSON only.
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       temperature: 0,
+      response_format: { type: "json_object" },
       max_output_tokens: 4000,
       input: [
         {
@@ -279,7 +251,10 @@ Output JSON only.
   }
 
   const data = await resp.json();
-  const parsed = parseJsonFromResponsesPayload(data);
+  const parsed = data?.output_parsed;
+  if (!parsed) {
+    throw new Error("OpenAI response missing output_parsed");
+  }
   if (!isUsableExtractedJson(parsed)) {
     throw new Error("Schema mismatch: extracted_json.rules missing");
   }

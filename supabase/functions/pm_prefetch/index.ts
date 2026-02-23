@@ -47,7 +47,7 @@ function json(status: number, body: unknown) {
   });
 }
 
-async function triggerWorker(seedDrugCode: string) {
+async function triggerWorker(seedDrugCode: string, drugCodes: string[]) {
   // fire-and-forget. Do NOT await in the request path.
   const url = `${SUPABASE_URL}/functions/v1/pm_prefetch_worker`;
 
@@ -55,12 +55,34 @@ async function triggerWorker(seedDrugCode: string) {
     method: "POST",
     headers: {
       Authorization: `Bearer ${SERVICE_KEY}`,
+      apikey: SERVICE_KEY,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ seed_drug_code: seedDrugCode }),
+    body: JSON.stringify({
+      seed_drug_code: seedDrugCode,
+      drug_codes: drugCodes,
+    }),
   }).catch(() => {
     // swallow errors; request should still succeed
   });
+}
+
+async function pickSeedDrugCode(drugCodes: string[]): Promise<string> {
+  const cleaned = drugCodes.map((c) => String(c).trim()).filter(Boolean);
+  if (!cleaned.length) throw new Error("no drug_codes");
+
+  // Prefer one that is already extracted (fastest UX).
+  const { data } = await sb
+    .from("dpd_pm_cache")
+    .select("drug_code, cache_status, extracted_json")
+    .in("drug_code", cleaned);
+
+  const rows = data ?? [];
+  const alreadyOk = rows.find((r: any) => r.cache_status === "OK" && r.extracted_json);
+  if (alreadyOk?.drug_code) return String(alreadyOk.drug_code);
+
+  // Otherwise just take first from list.
+  return cleaned[0];
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -442,22 +464,28 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
 export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> }) {
   try {
     const body = (await req.json().catch(() => ({}))) as PrefetchReq;
-    const code = String(body.drug_code ?? "").trim();
-    if (!code) return json(400, { status: "ERROR", message: "drug_code required" });
+    const codes =
+      Array.isArray(body.drug_codes) && body.drug_codes.length
+        ? body.drug_codes
+        : [(body.drug_code ?? "").toString()].filter(Boolean);
+    if (!codes.length) {
+      return json(400, { status: "ERROR", message: "drug_code(s) required" });
+    }
 
-    const detail = await prefetchOne(code);
+    const seed = await pickSeedDrugCode(codes);
+    const detail = await prefetchOne(seed);
     const ok = detail.status === "OK" ? 1 : 0;
     const noPdf = detail.status === "NO_PDF" ? 1 : 0;
     const fail = detail.status === "FAIL" ? 1 : 0;
 
     // Kick off background warm-cache (does NOT block response)
-    triggerWorker(code);
+    triggerWorker(seed, codes.map((c) => String(c).trim()).filter(Boolean));
 
-    console.log(`[pm_prefetch] total=1 ok=${ok} no_pdf=${noPdf} fail=${fail}`);
+    console.log(`[pm_prefetch] seed=${seed} total=1 ok=${ok} no_pdf=${noPdf} fail=${fail}`);
 
     return json(200, {
       status: "OK",
-      message: "Prefetch complete",
+      message: "Prefetch started",
       total: 1,
       ok,
       no_pdf: noPdf,

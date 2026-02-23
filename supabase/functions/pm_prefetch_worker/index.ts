@@ -16,7 +16,10 @@ type PrefetchDetail = {
   error?: string;
 };
 
-type WorkerReq = { seed_drug_code?: string | null };
+type WorkerReq = {
+  seed_drug_code?: string | null;
+  drug_codes?: string[] | null;
+};
 
 function getEnv(name: string): string {
   const denoVal = (globalThis as any)?.Deno?.env?.get?.(name);
@@ -317,7 +320,10 @@ async function worker(body: WorkerReq) {
   const seed = String(body.seed_drug_code ?? "").trim();
   if (!seed) return json(400, { status: "ERROR", message: "seed_drug_code required" });
 
-  const codes = await getVariantCodes(seed);
+  const inputCodes = Array.isArray(body.drug_codes)
+    ? body.drug_codes.map((c) => String(c).trim()).filter(Boolean)
+    : [];
+  const codes = inputCodes.length > 0 ? Array.from(new Set(inputCodes)) : await getVariantCodes(seed);
   console.log(`[pm_prefetch_worker] seed=${seed} variants=${codes.length}`);
 
   let ok = 0;
@@ -326,6 +332,8 @@ async function worker(body: WorkerReq) {
   let skipped = 0;
 
   for (const code of codes) {
+    if (code === seed) continue;
+
     const { data: existing } = await sb
       .from("dpd_pm_cache")
       .select("cache_status, extracted_json")

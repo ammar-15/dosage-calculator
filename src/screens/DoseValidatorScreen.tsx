@@ -308,8 +308,9 @@ export default function DoseValidatorScreen() {
     const fail = Number(data?.fail ?? 0);
     const total = Number(data?.total ?? codes.length);
     setPmCounts({ ok, noPdf, fail, total });
-    setPmCacheMessage(
-      `Monographs: OK ${ok}/${total} • NO_PDF ${noPdf} • FAIL ${fail} (done ${total}/${total})`,
+    setPmCacheMessage(`Monographs (${ok}/${total})`);
+    console.log(
+      `[pm_prefetch] total=${total} ok=${ok} no_pdf=${noPdf} fail=${fail}`,
     );
 
     const details = Array.isArray(data?.details)

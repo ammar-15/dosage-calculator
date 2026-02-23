@@ -293,13 +293,27 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
       return json(400, { status: "ERROR", message: "drug_code(s) required" });
     }
 
-    // Expand to all variants by brand_name (if we have at least 1 code)
+    // Expand to all variants by pm_pdf_url first, then brand_name.
     const seed = codes[0];
     const { data: seedRow } = await sb
       .from("dpd_drug_product_all")
-      .select("brand_name")
+      .select("drug_code, brand_name, pm_pdf_url")
       .eq("drug_code", seed)
       .maybeSingle();
+
+    const variantSet = new Set<string>(codes);
+
+    if (seedRow?.pm_pdf_url) {
+      const { data: variantRows } = await sb
+        .from("dpd_drug_product_all")
+        .select("drug_code")
+        .eq("pm_pdf_url", seedRow.pm_pdf_url);
+
+      const variantCodes = (variantRows ?? [])
+        .map((r: { drug_code?: string | null }) => String(r.drug_code ?? "").trim())
+        .filter(Boolean);
+      variantCodes.forEach((c) => variantSet.add(c));
+    }
 
     if (seedRow?.brand_name) {
       const { data: variantRows } = await sb
@@ -310,12 +324,11 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
       const variantCodes = (variantRows ?? [])
         .map((r: { drug_code?: string | null }) => String(r.drug_code ?? "").trim())
         .filter(Boolean);
-
-      codes.push(...variantCodes);
+      variantCodes.forEach((c) => variantSet.add(c));
     }
 
     // de-dupe
-    const uniqueCodes = Array.from(new Set(codes));
+    const uniqueCodes = Array.from(variantSet).filter(Boolean);
 
     const details: PrefetchDetail[] = [];
     for (const code of uniqueCodes) {
@@ -326,6 +339,9 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
     const ok = details.filter((d) => d.status === "OK").length;
     const noPdf = details.filter((d) => d.status === "NO_PDF").length;
     const fail = details.filter((d) => d.status === "FAIL").length;
+    console.log(
+      `[pm_prefetch] total=${uniqueCodes.length} ok=${ok} no_pdf=${noPdf} fail=${fail}`,
+    );
 
     return json(200, {
       status: "OK",

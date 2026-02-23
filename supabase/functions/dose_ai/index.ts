@@ -45,7 +45,8 @@ const sb = createClient(PROJECT_URL, SERVICE_KEY);
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
 };
 
 function json(status: number, body: unknown) {
@@ -77,6 +78,14 @@ Hackathon demo. Not medical advice.
 You are given structured dosing-relevant monograph data in JSON plus patient inputs.
 You MUST use ONLY the provided extracted monograph JSON.
 If the monograph does not contain enough info to compute, return BLOCK.
+
+CRITICAL RULES:
+- If monograph says "mg/kg in divided doses" or "mg/kg daily", treat it as TOTAL DAILY DOSE.
+- You MUST divide total daily dose by the number of doses to get per-dose mg.
+- If the indication in patient_notes is not present in recommended_dosing indications, return:
+  status="BLOCK" and explain "indication not supported by this monograph JSON".
+- If last_dose_time is null, next_eligible_time must be null (do not invent).
+- Output must be a single per-dose mg value (not total daily).
 
 Return STRICT JSON only:
 
@@ -138,13 +147,18 @@ ${JSON.stringify(otherVariantMonographs)}
   const parsed = JSON.parse(sliced);
 
   const status =
-    parsed?.status === "OK" || parsed?.status === "WARN" || parsed?.status === "BLOCK"
+    parsed?.status === "OK" ||
+    parsed?.status === "WARN" ||
+    parsed?.status === "BLOCK"
       ? parsed.status
       : "BLOCK";
 
   return {
     status,
-    message: typeof parsed?.message === "string" ? parsed.message : "Unable to compute from monograph.",
+    message:
+      typeof parsed?.message === "string"
+        ? parsed.message
+        : "Unable to compute from monograph.",
     suggested_next_dose_mg:
       typeof parsed?.suggested_next_dose_mg === "number"
         ? parsed.suggested_next_dose_mg
@@ -152,7 +166,9 @@ ${JSON.stringify(otherVariantMonographs)}
     interval_hours:
       typeof parsed?.interval_hours === "number" ? parsed.interval_hours : null,
     next_eligible_time:
-      typeof parsed?.next_eligible_time === "string" ? parsed.next_eligible_time : null,
+      typeof parsed?.next_eligible_time === "string"
+        ? parsed.next_eligible_time
+        : null,
     patient_specific_notes:
       typeof parsed?.patient_specific_notes === "string"
         ? parsed.patient_specific_notes
@@ -204,7 +220,8 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
     if (!okRows.length) {
       return json(200, {
         status: "BLOCK",
-        message: "No Product Monograph dosing data available in DPD for this product.",
+        message:
+          "No Product Monograph dosing data available in DPD for this product.",
         suggested_next_dose_mg: null,
         interval_hours: null,
         next_eligible_time: null,
@@ -225,7 +242,11 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       extracted_json: r.extracted_json,
     }));
 
-    const calc = await computeFromMonograph(body, primary.extracted_json, others);
+    const calc = await computeFromMonograph(
+      body,
+      primary.extracted_json,
+      others,
+    );
 
     return json(200, {
       status: calc.status,

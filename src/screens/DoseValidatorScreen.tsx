@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Keyboard, Platform, ScrollView, View } from "react-native";
 import { Controller, useForm } from "react-hook-form";
 import {
+  ActivityIndicator,
   Button,
   Card,
   Divider,
@@ -88,7 +89,15 @@ export default function DoseValidatorScreen() {
     setValue,
     watch,
   } = useForm<FormValues>({
-    defaultValues: { gender: "other" },
+    defaultValues: {
+      patientName: "",
+      weightKg: "",
+      ageYears: "",
+      gender: "other",
+      drugName: "",
+      lastDoseMg: "",
+      notes: "",
+    },
   });
 
   const theme = useTheme();
@@ -116,6 +125,7 @@ export default function DoseValidatorScreen() {
   const [isSearching, setIsSearching] = useState(false);
 
   const [selectedDrug, setSelectedDrug] = useState<BrandSuggestion | null>(null);
+  const [selectedDrugCode, setSelectedDrugCode] = useState<string | null>(null);
 
   const [lastTakenDate, setLastTakenDate] = useState<Date | null>(null);
   const [showDatePicker, setShowDatePicker] = useState(false);
@@ -225,6 +235,7 @@ export default function DoseValidatorScreen() {
     setShowSuggestions(false);
 
     setSelectedDrug(item);
+    setSelectedDrugCode(item.drug_code ?? null);
     Keyboard.dismiss();
   };
 
@@ -238,6 +249,7 @@ export default function DoseValidatorScreen() {
         weight_kg: values.weightKg ? Number(values.weightKg) : null,
         age_years: values.ageYears ? Number(values.ageYears) : null,
         gender: values.gender ?? null,
+        drug_code: selectedDrugCode ?? null,
         drug_name: values.drugName ?? "",
         last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
         last_dose_time: lastTakenDate?.toISOString() ?? null,
@@ -309,6 +321,7 @@ export default function DoseValidatorScreen() {
   return (
     <ScrollView
       nestedScrollEnabled
+      scrollEnabled={!showSuggestions}
       keyboardShouldPersistTaps="handled"
       contentContainerStyle={{
         paddingHorizontal: 16,
@@ -335,7 +348,7 @@ export default function DoseValidatorScreen() {
             render={({ field: { onChange, value } }) => (
               <TextInput
                 label="Patient name"
-                value={value}
+                value={value ?? ""}
                 onChangeText={onChange}
                 outlineStyle={{ borderRadius: 16 }}
                 mode="outlined"
@@ -355,7 +368,7 @@ export default function DoseValidatorScreen() {
                 render={({ field: { onChange, value } }) => (
                   <TextInput
                     label="Weight (kg)"
-                    value={value}
+                    value={value ?? ""}
                     onChangeText={onChange}
                     outlineStyle={{ borderRadius: 16 }}
                     mode="outlined"
@@ -371,7 +384,7 @@ export default function DoseValidatorScreen() {
                 render={({ field: { onChange, value } }) => (
                   <TextInput
                     label="Age (years)"
-                    value={value}
+                    value={value ?? ""}
                     onChangeText={onChange}
                     outlineStyle={{ borderRadius: 16 }}
                     mode="outlined"
@@ -410,11 +423,12 @@ export default function DoseValidatorScreen() {
               render={({ field: { onChange, value } }) => (
                 <TextInput
                   label="Drug name"
-                  value={value}
+                  value={value ?? ""}
                   onChangeText={(text) => {
                     onChange(text);
                     setDrugQuery(text);
                     setSelectedDrug(null);
+                    setSelectedDrugCode(null);
                     if (text.trim().length >= 2) {
                       setShowSuggestions(true);
                     } else {
@@ -452,10 +466,19 @@ export default function DoseValidatorScreen() {
                   zIndex: 30,
                 }}
               >
-                {suggestions.length > 0 ? (
+                {isSearching ? (
+                  <View style={{ paddingVertical: 14, paddingHorizontal: 16 }}>
+                    <ActivityIndicator size="small" />
+                    <Text style={{ marginTop: 8, color: "rgba(255,255,255,0.78)" }}>
+                      Loading suggestions...
+                    </Text>
+                  </View>
+                ) : suggestions.length > 0 ? (
                   <ScrollView
                     nestedScrollEnabled
                     keyboardShouldPersistTaps="handled"
+                    showsVerticalScrollIndicator
+                    onStartShouldSetResponderCapture={() => true}
                     style={{ maxHeight: 240 }}
                   >
                     {suggestions.map((item, index) => (
@@ -466,9 +489,9 @@ export default function DoseValidatorScreen() {
                       />
                     ))}
                   </ScrollView>
-                ) : (
+                ) : drugQuery.trim().length >= 2 ? (
                   <List.Item title="No matches" />
-                )}
+                ) : null}
               </Surface>
             ) : null}
           </View>
@@ -487,7 +510,7 @@ export default function DoseValidatorScreen() {
                 render={({ field: { onChange, value } }) => (
                   <TextInput
                     label="Last dose (mg)"
-                    value={value}
+                    value={value ?? ""}
                     onChangeText={onChange}
                     outlineStyle={{ borderRadius: 16 }}
                     mode="outlined"
@@ -540,7 +563,7 @@ export default function DoseValidatorScreen() {
             render={({ field: { onChange, value } }) => (
               <TextInput
                 label="Additional comments"
-                value={value}
+                value={value ?? ""}
                 onChangeText={onChange}
                 outlineStyle={{ borderRadius: 16 }}
                 mode="outlined"
@@ -616,6 +639,7 @@ export default function DoseValidatorScreen() {
           setSuggestions([]);
           setShowSuggestions(false);
           setSelectedDrug(null);
+          setSelectedDrugCode(null);
           setLastTakenDate(null);
           setShowDatePicker(false);
           setShowTimePicker(false);

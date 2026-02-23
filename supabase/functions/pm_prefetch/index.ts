@@ -14,6 +14,8 @@ type CacheStatus =
   | "FETCH_FAIL"
   | "PARSE_FAIL";
 
+type DbResult<T> = { data: T; error: any };
+
 function getEnv(name: string): string {
   const denoVal = (globalThis as any)?.Deno?.env?.get?.(name);
   if (typeof denoVal === "string" && denoVal) return denoVal;
@@ -42,8 +44,29 @@ function json(status: number, body: unknown) {
   });
 }
 
+function sbErr(label: string, error: any): never {
+  throw new Error(`${label}: ${error?.message ?? JSON.stringify(error)}`);
+}
+
+async function mustWrite<T>(q: Promise<DbResult<T>>, label: string): Promise<T> {
+  const { data, error } = await q;
+  if (error) sbErr(label, error);
+  if (data == null) throw new Error(`${label}: no row affected`);
+  return data;
+}
+
+async function mustOk<T>(q: Promise<DbResult<T>>, label: string): Promise<T> {
+  const { data, error } = await q;
+  if (error) sbErr(label, error);
+  return data;
+}
+
 function isUsableExtractedJson(v: any): boolean {
   return !!v && Array.isArray(v?.rules) && v.rules.length > 0;
+}
+
+function isJsonObject(v: any): boolean {
+  return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
 async function quickPdfHeaderCheck(url: string) {
@@ -63,61 +86,16 @@ async function quickPdfHeaderCheck(url: string) {
     buf[1] === 0x50 &&
     buf[2] === 0x44 &&
     buf[3] === 0x46;
+
   if (!isPdf) throw new Error("Not a valid PDF");
 }
 
 async function openaiExtractPdfToJson(pmUrl: string) {
   const prompt = `
 You are extracting dosing-relevant information from a Canadian Product Monograph (PDF).
-GOAL:
-1) Do section-first extraction from rule-heavy zones.
-2) Convert to normalized IF -> THEN rules with confidence.
-3) Preserve short source excerpts with page refs (auditability).
+Return STRICT JSON ONLY (no markdown).
 
-SECTION-FIRST RULE:
-Only trust content under these headings (or close variants):
-- INDICATIONS / CLINICAL USE
-- CONTRAINDICATIONS
-- WARNINGS / PRECAUTIONS
-- DOSAGE AND ADMINISTRATION
-- PEDIATRICS / GERIATRICS / RENAL IMPAIRMENT (special populations)
-- ADMINISTRATION / RECONSTITUTION / INFUSION
-- ADVERSE REACTIONS / DRUG INTERACTIONS
-
-HEADING DETECTION:
-Treat headings as lines that look like section headers, using variants.
-Assign each paragraph to the most recent heading.
-
-RULE CONVERSION:
-Convert sentences into IF -> THEN rules using trigger phrases.
-
-Indications triggers:
-"indicated for", "used in", "for the treatment of", "therapy of", "suggested for"
-Contra triggers:
-"contraindicated", "should not be used", "must not be used", "avoid"
-Dosing triggers:
-dose patterns (mg/kg, mg), frequency (q6h, every 6 hours), duration, route, infusion time/rate
-Route triggers:
-"must be given orally", "not effective by the oral route", "should never be given intramuscularly"
-Monitoring triggers:
-"monitor", "serum levels", "renal function", "ototoxicity", "nephrotoxicity", "adjust dose"
-
-NORMALIZATION:
-- Normalize headings (e.g., DOSAGE & ADMINISTRATION -> DOSING; WARNINGS AND PRECAUTIONS -> WARNINGS).
-- Normalize routes (intravenous|IV|i.v. -> IV; oral|PO|by mouth -> PO).
-- Normalize common pathogens/conditions where explicitly stated (e.g., MRSA, C. difficile).
-
-CONFIDENCE:
-HIGH: "contraindicated", "should never", "must be given", "not effective"
-MED: "recommended", "should be used", "usual dose"
-LOW: "may", "suggested", "advisable"
-
-OUTPUT:
-Return STRICT JSON ONLY matching this schema.
-Do not invent clinical guidance. If unsure, omit the rule.
-
-SCHEMA:
-
+Schema:
 {
   "meta": {
     "drug_name": string|null,
@@ -126,7 +104,6 @@ SCHEMA:
     "source": "dpd_pm_pdf",
     "source_pages": number|null
   },
-
   "sections": [
     {
       "heading_raw": string,
@@ -135,41 +112,33 @@ SCHEMA:
       "page_refs": number[]
     }
   ],
-
   "normalization": {
     "heading_map": [{"from": string, "to": string}],
     "route_map": [{"from": string, "to": "IV"|"PO"|"IM"|"SC"|"INHALATION"|"TOPICAL"|"OTHER"}],
     "condition_map": [{"from": string, "to": string}]
   },
-
   "rules": [
     {
       "rule_type": "INDICATION"|"CONTRAINDICATION"|"DOSING"|"ROUTE"|"MONITORING"|"INTERACTION"|"ADVERSE_REACTION",
       "confidence": "HIGH"|"MED"|"LOW",
-
       "if": {
         "population": string|null,
         "age_min_years": number|null,
         "age_max_years": number|null,
         "weight_min_kg": number|null,
         "weight_max_kg": number|null,
-
         "indication_text": string|null,
         "pathogen_text": string|null,
         "condition_text": string|null,
-
         "route": "IV"|"PO"|"IM"|"SC"|"INTRATHECAL"|"OTHER"|null,
         "renal_impairment": "none"|"mild"|"moderate"|"severe"|null,
         "hepatic_impairment": "none"|"mild"|"moderate"|"severe"|null,
-
         "contra_flag": string|null,
         "interaction_text": string|null
       },
-
       "then": {
         "allow": boolean|null,
         "block": boolean|null,
-
         "dose": {
           "amount": number|null,
           "unit": "mg"|"g"|null,
@@ -177,32 +146,26 @@ SCHEMA:
           "per_day": boolean|null,
           "divided_doses": number|null
         },
-
         "frequency": {
           "interval_hours": number|null,
           "frequency_text": string|null
         },
-
         "duration": {
           "amount": number|null,
           "unit": "days"|"weeks"|null,
           "text": string|null
         },
-
         "administration": {
           "infusion_minutes": number|null,
           "max_rate_mg_per_min": number|null,
           "dilution_text": string|null
         },
-
         "monitoring": {
           "required": boolean|null,
           "items": string[]
         },
-
         "notes": string|null
       },
-
       "source": {
         "page_refs": number[],
         "excerpts": string[]
@@ -210,16 +173,15 @@ SCHEMA:
     }
   ]
 }
-
-Also include a compact audit trail in sections and rule.source.excerpts (short snippets).
-Output JSON only.
 Limit sections to at most 10 entries.
 Truncate section.text to max 1200 characters.
+Return JSON only.
 `;
 
   const ctrl = new AbortController();
-  const timeoutId = setTimeout(() => ctrl.abort(), 70_000);
+  const timeoutId = setTimeout(() => ctrl.abort(), 55_000);
   let resp: Response;
+
   try {
     resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -232,7 +194,7 @@ Truncate section.text to max 1200 characters.
         model: "gpt-4o-mini",
         temperature: 0,
         text: { format: { type: "json_object" } },
-        max_output_tokens: 2200,
+        max_output_tokens: 1600,
         input: [
           {
             role: "system",
@@ -242,10 +204,7 @@ Truncate section.text to max 1200 characters.
             role: "user",
             content: [
               { type: "input_file", file_url: pmUrl },
-              {
-                type: "input_text",
-                text: "Extract dosing-relevant JSON from this PDF.",
-              },
+              { type: "input_text", text: "Extract dosing-relevant JSON from this PDF." },
             ],
           },
         ],
@@ -270,12 +229,10 @@ Truncate section.text to max 1200 characters.
     typeof data?.output_text === "string" && data.output_text.trim()
       ? data.output_text
       : (() => {
-          // fallback: walk output content
           const parts: string[] = [];
           for (const item of data?.output ?? []) {
             for (const c of item?.content ?? []) {
-              if (typeof c?.text === "string" && c.text.trim())
-                parts.push(c.text);
+              if (typeof c?.text === "string" && c.text.trim()) parts.push(c.text);
             }
           }
           return parts.join("\n").trim();
@@ -287,19 +244,16 @@ Truncate section.text to max 1200 characters.
   if (!trimmed.startsWith("{")) {
     throw new Error("OpenAI did not return a JSON object");
   }
+
   const parsed = JSON.parse(trimmed);
-  if (!parsed) {
-    throw new Error("OpenAI response missing JSON object");
+  if (!isJsonObject(parsed)) {
+    throw new Error("Invalid JSON object");
   }
-  if (!isUsableExtractedJson(parsed)) {
-    throw new Error("Schema mismatch: extracted_json.rules missing");
-  }
+
   return parsed;
 }
 
-export async function pmPrefetchHandler(req: {
-  json: () => Promise<PrefetchReq>;
-}) {
+export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> }) {
   try {
     const body = (await req.json().catch(() => ({}))) as PrefetchReq;
     const drugCode = String(body.drug_code ?? "").trim();
@@ -313,7 +267,7 @@ export async function pmPrefetchHandler(req: {
       .eq("drug_code", drugCode)
       .maybeSingle();
 
-    if (isUsableExtractedJson(cacheRow?.extracted_json)) {
+    if (isJsonObject(cacheRow?.extracted_json)) {
       return json(200, {
         status: "OK",
         extracted_json: cacheRow?.extracted_json,
@@ -322,6 +276,7 @@ export async function pmPrefetchHandler(req: {
 
     let pmUrl = String(cacheRow?.pm_pdf_url ?? "").trim();
     let pmPdfUrlSource: "cache" | "dpd_drug_product_all" = "cache";
+
     if (!pmUrl) {
       const { data: srcRow } = await sb
         .from("dpd_drug_product_all")
@@ -329,95 +284,165 @@ export async function pmPrefetchHandler(req: {
         .eq("drug_code", drugCode)
         .maybeSingle();
 
-      pmUrl = String(srcRow?.pm_pdf_url ?? "").trim();
+      if (!srcRow) {
+        await mustOk(
+          sb
+            .from("dpd_pm_cache")
+            .upsert(
+              {
+                drug_code: drugCode,
+                cache_status: "NO_PDF" as CacheStatus,
+                cache_error: "drug_code not found in dpd_drug_product_all",
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: "drug_code" },
+            ),
+          "SET NO_PDF source missing",
+        );
+
+        return json(200, { status: "ERROR", message: "No pm_pdf_url" });
+      }
+
+      pmUrl = String(srcRow.pm_pdf_url ?? "").trim();
       pmPdfUrlSource = "dpd_drug_product_all";
 
       if (cacheRow) {
-        await sb
-          .from("dpd_pm_cache")
-          .update({
-            brand_name: srcRow?.brand_name ?? cacheRow?.brand_name ?? null,
-            din: srcRow?.din ?? cacheRow?.din ?? null,
-            pm_pdf_url: srcRow?.pm_pdf_url ?? cacheRow?.pm_pdf_url ?? null,
-            pm_date: srcRow?.pm_date ?? cacheRow?.pm_date ?? null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("drug_code", drugCode);
+        await mustWrite(
+          sb
+            .from("dpd_pm_cache")
+            .update({
+              brand_name: srcRow.brand_name ?? cacheRow.brand_name ?? null,
+              din: srcRow.din ?? cacheRow.din ?? null,
+              pm_pdf_url: srcRow.pm_pdf_url ?? cacheRow.pm_pdf_url ?? null,
+              pm_date: srcRow.pm_date ?? cacheRow.pm_date ?? null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("drug_code", drugCode)
+            .select("drug_code")
+            .maybeSingle(),
+          "UPDATE cache metadata",
+        );
       } else {
-        await sb.from("dpd_pm_cache").upsert(
-          {
-            drug_code: drugCode,
-            brand_name: srcRow?.brand_name ?? null,
-            din: srcRow?.din ?? null,
-            pm_pdf_url: srcRow?.pm_pdf_url ?? null,
-            pm_date: srcRow?.pm_date ?? null,
-            cache_status: "NEW" as CacheStatus,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "drug_code" },
+        await mustOk(
+          sb
+            .from("dpd_pm_cache")
+            .upsert(
+              {
+                drug_code: drugCode,
+                brand_name: srcRow.brand_name ?? null,
+                din: srcRow.din ?? null,
+                pm_pdf_url: srcRow.pm_pdf_url ?? null,
+                pm_date: srcRow.pm_date ?? null,
+                cache_status: "NEW" as CacheStatus,
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: "drug_code" },
+            ),
+          "UPSERT new cache row",
         );
       }
     }
 
     if (!pmUrl) {
-      await sb
-        .from("dpd_pm_cache")
-        .update({
-          cache_status: "NO_PDF" as CacheStatus,
-          cache_error: "No Product Monograph PDF URL for this drug_code",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("drug_code", drugCode);
+      await mustOk(
+        sb
+          .from("dpd_pm_cache")
+          .upsert(
+            {
+              drug_code: drugCode,
+              cache_status: "NO_PDF" as CacheStatus,
+              cache_error: "No Product Monograph PDF URL for this drug_code",
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "drug_code" },
+          ),
+        "SET NO_PDF",
+      );
 
       return json(200, { status: "ERROR", message: "No pm_pdf_url" });
     }
 
-    await sb
-      .from("dpd_pm_cache")
-      .update({
-        cache_status: "FETCHING" as CacheStatus,
-        fetched_at: new Date().toISOString(),
-        cache_error: null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("drug_code", drugCode);
+    await mustOk(
+      sb
+        .from("dpd_pm_cache")
+        .upsert(
+          {
+            drug_code: drugCode,
+            pm_pdf_url: pmUrl,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "drug_code" },
+        ),
+      "ENSURE cache row exists",
+    );
+
+    await mustWrite(
+      sb
+        .from("dpd_pm_cache")
+        .update({
+          cache_status: "FETCHING" as CacheStatus,
+          fetched_at: new Date().toISOString(),
+          cache_error: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("drug_code", drugCode)
+        .select("drug_code")
+        .maybeSingle(),
+      "SET FETCHING",
+    );
 
     try {
       await quickPdfHeaderCheck(pmUrl);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "fetch failed";
-      await sb
-        .from("dpd_pm_cache")
-        .update({
-          cache_status: "FETCH_FAIL" as CacheStatus,
-          cache_error: msg,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("drug_code", drugCode);
+      await mustWrite(
+        sb
+          .from("dpd_pm_cache")
+          .update({
+            cache_status: "FETCH_FAIL" as CacheStatus,
+            cache_error: msg,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("drug_code", drugCode)
+          .select("drug_code")
+          .maybeSingle(),
+        "SET FETCH_FAIL",
+      );
+
       return json(200, { status: "ERROR", message: msg });
     }
 
-    await sb
-      .from("dpd_pm_cache")
-      .update({
-        cache_status: "PARSING" as CacheStatus,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("drug_code", drugCode);
+    await mustWrite(
+      sb
+        .from("dpd_pm_cache")
+        .update({
+          cache_status: "PARSING" as CacheStatus,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("drug_code", drugCode)
+        .select("drug_code")
+        .maybeSingle(),
+      "SET PARSING",
+    );
 
     try {
       const extracted = await openaiExtractPdfToJson(pmUrl);
 
-      await sb
-        .from("dpd_pm_cache")
-        .update({
-          extracted_json: extracted,
-          cache_status: "OK" as CacheStatus,
-          parsed_at: new Date().toISOString(),
-          cache_error: null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("drug_code", drugCode);
+      await mustWrite(
+        sb
+          .from("dpd_pm_cache")
+          .update({
+            extracted_json: extracted,
+            cache_status: "OK" as CacheStatus,
+            parsed_at: new Date().toISOString(),
+            cache_error: null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("drug_code", drugCode)
+          .select("drug_code")
+          .maybeSingle(),
+        "SAVE extracted_json",
+      );
 
       return json(200, {
         status: "OK",
@@ -426,14 +451,19 @@ export async function pmPrefetchHandler(req: {
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "parse failed";
-      await sb
-        .from("dpd_pm_cache")
-        .update({
-          cache_status: "PARSE_FAIL" as CacheStatus,
-          cache_error: msg,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("drug_code", drugCode);
+      await mustWrite(
+        sb
+          .from("dpd_pm_cache")
+          .update({
+            cache_status: "PARSE_FAIL" as CacheStatus,
+            cache_error: msg,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("drug_code", drugCode)
+          .select("drug_code")
+          .maybeSingle(),
+        "SET PARSE_FAIL",
+      );
 
       return json(200, { status: "ERROR", message: msg });
     }
@@ -447,7 +477,10 @@ export default pmPrefetchHandler;
 
 serve((req) => {
   if (req.method === "OPTIONS") {
-    return new Response("ok", { status: 200, headers: corsHeaders });
+    return new Response("ok", {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "text/plain" },
+    });
   }
   return pmPrefetchHandler({ json: () => req.json() });
 });

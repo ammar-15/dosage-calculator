@@ -291,39 +291,40 @@ export default function DoseValidatorScreen() {
 
     setPmCacheStatus("loading");
     setPmCacheMessage(`Prefetching monographs... 0/${codes.length}`);
+    let ok = 0;
+    let noPdf = 0;
+    let fail = 0;
+    let firstOkCode: string | null = null;
 
-    const { data, error } = await supabase.functions.invoke("pm_prefetch", {
-      body: { drug_codes: codes },
-    });
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      const { data, error } = await supabase.functions.invoke("pm_prefetch", {
+        body: { drug_code: code },
+      });
 
-    if (error) {
-      setPmCounts({ ok: 0, noPdf: 0, fail: codes.length, total: codes.length });
-      setPmCacheStatus("fail");
-      setPmCacheMessage(`Monograph prefetch failed (${codes.length}). ${error.message}`);
-      return;
+      if (error) {
+        fail += 1;
+      } else {
+        const st = String(data?.details?.[0]?.status ?? data?.status ?? "").toUpperCase();
+        if (st === "OK") {
+          ok += 1;
+          if (!firstOkCode) firstOkCode = code;
+        } else if (st === "NO_PDF") {
+          noPdf += 1;
+        } else {
+          fail += 1;
+        }
+      }
+
+      setPmCacheMessage(`Prefetching monographs... ${i + 1}/${codes.length} (ok=${ok})`);
     }
 
-    const ok = Number(data?.ok ?? 0);
-    const noPdf = Number(data?.no_pdf ?? 0);
-    const fail = Number(data?.fail ?? 0);
-    const total = Number(data?.total ?? codes.length);
-    setPmCounts({ ok, noPdf, fail, total });
-    setPmCacheMessage(`Monographs (${ok}/${total})`);
-    console.log(
-      `[pm_prefetch] total=${total} ok=${ok} no_pdf=${noPdf} fail=${fail}`,
-    );
+    setPmCounts({ ok, noPdf, fail, total: codes.length });
+    console.log(`[pm_prefetch] total=${codes.length} ok=${ok} no_pdf=${noPdf} fail=${fail}`);
+    if (firstOkCode) setSelectedDrugCode(firstOkCode);
 
-    const details = Array.isArray(data?.details)
-      ? (data.details as { drug_code?: string; status?: string }[])
-      : [];
-    const firstOk = details.find((d) => String(d.status ?? "").toUpperCase() === "OK");
-    if (firstOk?.drug_code) {
-      setSelectedDrugCode(String(firstOk.drug_code));
-    }
-
-    if (ok > 0) setPmCacheStatus("ok");
-    else if (noPdf > 0 && fail === 0) setPmCacheStatus("no_pdf");
-    else setPmCacheStatus("fail");
+    setPmCacheMessage(`Monographs (${ok}/${codes.length})`);
+    setPmCacheStatus(ok > 0 ? "ok" : noPdf > 0 && fail === 0 ? "no_pdf" : "fail");
   };
 
   const onSubmit = async (values: FormValues) => {

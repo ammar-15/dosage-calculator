@@ -426,73 +426,24 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
 export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> }) {
   try {
     const body = (await req.json().catch(() => ({}))) as PrefetchReq;
-    const codes =
-      Array.isArray(body.drug_codes) && body.drug_codes.length
-        ? body.drug_codes.map((c) => String(c).trim()).filter(Boolean)
-        : [(body.drug_code ?? "").toString().trim()].filter(Boolean);
+    const code = String(body.drug_code ?? "").trim();
+    if (!code) return json(400, { status: "ERROR", message: "drug_code required" });
 
-    if (!codes.length) {
-      return json(400, { status: "ERROR", message: "drug_code(s) required" });
-    }
+    const detail = await prefetchOne(code);
+    const ok = detail.status === "OK" ? 1 : 0;
+    const noPdf = detail.status === "NO_PDF" ? 1 : 0;
+    const fail = detail.status === "FAIL" ? 1 : 0;
 
-    // Expand to all variants by pm_pdf_url first, then brand_name.
-    const seed = codes[0];
-    const { data: seedRow } = await sb
-      .from("dpd_drug_product_all")
-      .select("drug_code, brand_name, pm_pdf_url")
-      .eq("drug_code", seed)
-      .maybeSingle();
-
-    const variantSet = new Set<string>(codes);
-
-    if (seedRow?.pm_pdf_url) {
-      const { data: variantRows } = await sb
-        .from("dpd_drug_product_all")
-        .select("drug_code")
-        .eq("pm_pdf_url", seedRow.pm_pdf_url);
-
-      const variantCodes = (variantRows ?? [])
-        .map((r: { drug_code?: string | null }) => String(r.drug_code ?? "").trim())
-        .filter(Boolean);
-      variantCodes.forEach((c) => variantSet.add(c));
-    }
-
-    if (seedRow?.brand_name) {
-      const { data: variantRows } = await sb
-        .from("dpd_drug_product_all")
-        .select("drug_code")
-        .eq("brand_name", seedRow.brand_name);
-
-      const variantCodes = (variantRows ?? [])
-        .map((r: { drug_code?: string | null }) => String(r.drug_code ?? "").trim())
-        .filter(Boolean);
-      variantCodes.forEach((c) => variantSet.add(c));
-    }
-
-    // de-dupe
-    const uniqueCodes = Array.from(variantSet).filter(Boolean);
-
-    const details: PrefetchDetail[] = [];
-    for (const code of uniqueCodes) {
-      const detail = await prefetchOne(code);
-      details.push(detail);
-    }
-
-    const ok = details.filter((d) => d.status === "OK").length;
-    const noPdf = details.filter((d) => d.status === "NO_PDF").length;
-    const fail = details.filter((d) => d.status === "FAIL").length;
-    console.log(
-      `[pm_prefetch] total=${uniqueCodes.length} ok=${ok} no_pdf=${noPdf} fail=${fail}`,
-    );
+    console.log(`[pm_prefetch] total=1 ok=${ok} no_pdf=${noPdf} fail=${fail}`);
 
     return json(200, {
       status: "OK",
       message: "Prefetch complete",
-      total: uniqueCodes.length,
+      total: 1,
       ok,
       no_pdf: noPdf,
       fail,
-      details,
+      details: [detail],
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "unknown error";

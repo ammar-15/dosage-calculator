@@ -308,8 +308,9 @@ export default function DoseValidatorScreen() {
         const ok = st === "OK" ? 1 : 0;
         const noPdf = st === "NO_PDF" ? 1 : 0;
         const fail = ok === 0 && noPdf === 0 ? 1 : 0;
-        setPmCounts({ ok, noPdf, fail, total: 1 });
-        setPmCacheMessage(`Monographs (${ok}/1)`);
+        const totalTried = Number(data?.total_tried ?? 1);
+        setPmCounts({ ok, noPdf, fail, total: totalTried });
+        setPmCacheMessage(`Monographs (${ok}/${totalTried})`);
 
         const firstOk = Array.isArray(data?.details)
           ? (data.details as { drug_code?: string; status?: string }[]).find(

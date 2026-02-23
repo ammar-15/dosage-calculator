@@ -31,7 +31,6 @@ function getEnv(name: string): string {
 
 const SUPABASE_URL = getEnv("PROJECT_URL");
 const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
-const ANON_KEY = getEnv("ANON_KEY");
 const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
 
 const sb = createClient(SUPABASE_URL, SERVICE_KEY);
@@ -48,50 +47,58 @@ function json(status: number, body: unknown) {
   });
 }
 
-async function triggerWorker(seedDrugCode: string, drugCodes: string[]) {
-  const url = `${SUPABASE_URL}/functions/v1/pm_prefetch_worker`;
-  const workerRequest = fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${SERVICE_KEY}`,
-      apikey: ANON_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      seed_drug_code: seedDrugCode,
-      drug_codes: drugCodes,
-    }),
-  }).catch(() => {
-    // request should still succeed if worker kick-off fails
-  });
-
-  const edgeRuntime = (globalThis as any)?.EdgeRuntime;
-  if (edgeRuntime && typeof edgeRuntime.waitUntil === "function") {
-    edgeRuntime.waitUntil(workerRequest);
-  }
+function isUsableExtractedJson(v: any): boolean {
+  return !!v && Array.isArray(v?.rules) && v.rules.length >= 1;
 }
 
-async function pickSeedDrugCode(drugCodes: string[]): Promise<string> {
-  const cleaned = drugCodes.map((c) => String(c).trim()).filter(Boolean);
+async function pickCandidateOrder(drugCodes: string[]): Promise<string[]> {
+  const cleaned = Array.from(
+    new Set(drugCodes.map((c) => String(c).trim()).filter(Boolean)),
+  );
   if (!cleaned.length) throw new Error("no drug_codes");
 
-  // Prefer one that is already extracted (fastest UX).
-  const { data } = await sb
-    .from("dpd_pm_cache")
-    .select("drug_code, cache_status, extracted_json")
-    .in("drug_code", cleaned);
+  const [{ data: cacheRows }, { data: srcRows }] = await Promise.all([
+    sb
+      .from("dpd_pm_cache")
+      .select("drug_code, cache_status, extracted_json")
+      .in("drug_code", cleaned),
+    sb
+      .from("dpd_drug_product_all")
+      .select("drug_code, pm_pdf_url")
+      .in("drug_code", cleaned),
+  ]);
 
-  const rows = data ?? [];
-  const alreadyOk = rows.find(
-    (r: any) =>
-      r.cache_status === "OK" &&
-      r.extracted_json &&
-      Array.isArray(r.extracted_json?.rules),
-  );
-  if (alreadyOk?.drug_code) return String(alreadyOk.drug_code);
+  const cacheByCode = new Map<string, any>();
+  for (const row of cacheRows ?? []) {
+    cacheByCode.set(String(row.drug_code), row);
+  }
 
-  // Otherwise just take first from list.
-  return cleaned[0];
+  const hasPdfUrl = new Set<string>();
+  for (const row of srcRows ?? []) {
+    const code = String(row.drug_code ?? "").trim();
+    const url = String(row.pm_pdf_url ?? "").trim();
+    if (code && url) hasPdfUrl.add(code);
+  }
+
+  const okFirst: string[] = [];
+  const pdfNext: string[] = [];
+  const rest: string[] = [];
+
+  for (const code of cleaned) {
+    const cached = cacheByCode.get(code);
+    if (
+      cached?.cache_status === "OK" &&
+      isUsableExtractedJson(cached?.extracted_json)
+    ) {
+      okFirst.push(code);
+    } else if (hasPdfUrl.has(code)) {
+      pdfNext.push(code);
+    } else {
+      rest.push(code);
+    }
+  }
+
+  return [...okFirst, ...pdfNext, ...rest];
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -131,6 +138,10 @@ async function fetchWithRetry(url: string, max = 4): Promise<Response> {
 }
 
 function parseJsonFromResponsesPayload(data: any): unknown {
+  function stripCodeFences(s: string): string {
+    return s.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+  }
+
   const textParts: string[] = [];
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     textParts.push(data.output_text);
@@ -144,16 +155,15 @@ function parseJsonFromResponsesPayload(data: any): unknown {
     }
   }
 
-  const combined = textParts.join("\n").trim();
+  let combined = stripCodeFences(textParts.join("\n").trim());
   if (!combined) throw new Error("Empty OpenAI response");
 
   const firstBrace = combined.indexOf("{");
   const lastBrace = combined.lastIndexOf("}");
-  const sliced =
-    firstBrace >= 0 && lastBrace >= 0
-      ? combined.slice(firstBrace, lastBrace + 1)
-      : combined;
-  return JSON.parse(sliced);
+  if (firstBrace < 0 || lastBrace < 0) throw new Error("No JSON object found");
+
+  combined = combined.slice(firstBrace, lastBrace + 1);
+  return JSON.parse(combined);
 }
 
 async function openaiExtractPdfToJson(pmUrl: string) {
@@ -417,10 +427,24 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       })
       .eq("drug_code", drugCode);
 
-    console.log(`[pm_prefetch] code=${drugCode} fetching pdf ${pmUrl}`);
-    const pdfRes = await fetchWithRetry(pmUrl, 4);
-    const buf = new Uint8Array(await pdfRes.arrayBuffer());
-    const hash = await sha256Hex(buf);
+    let hash = "";
+    try {
+      console.log(`[pm_prefetch] code=${drugCode} fetching pdf ${pmUrl}`);
+      const pdfRes = await fetchWithRetry(pmUrl, 4);
+      const buf = new Uint8Array(await pdfRes.arrayBuffer());
+      hash = await sha256Hex(buf);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "fetch failed";
+      await sb
+        .from("dpd_pm_cache")
+        .update({
+          cache_status: "FETCH_FAIL" as CacheStatus,
+          cache_error: msg,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("drug_code", drugCode);
+      return { drug_code: drugCode, status: "FAIL", error: msg };
+    }
 
     if (
       cacheRow?.cache_status === "OK" &&
@@ -446,37 +470,40 @@ async function prefetchOne(drugCode: string): Promise<PrefetchDetail> {
       })
       .eq("drug_code", drugCode);
 
-    console.log(`[pm_prefetch] code=${drugCode} calling openai`);
-    const extracted = await openaiExtractPdfToJson(pmUrl);
-    const hasRules = Array.isArray((extracted as any)?.rules);
-    if (!hasRules) {
-      throw new Error("Schema mismatch: extracted_json.rules missing");
+    try {
+      console.log(`[pm_prefetch] code=${drugCode} calling openai`);
+      const extracted = await openaiExtractPdfToJson(pmUrl);
+      if (!isUsableExtractedJson(extracted)) {
+        throw new Error("Schema mismatch: extracted_json.rules missing");
+      }
+      console.log(`[pm_prefetch] code=${drugCode} openai done, updating cache`);
+      await sb
+        .from("dpd_pm_cache")
+        .update({
+          cache_status: "OK" as CacheStatus,
+          parsed_at: new Date().toISOString(),
+          source_hash: hash,
+          extracted_json: extracted,
+          extracted_text: null,
+          cache_error: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("drug_code", drugCode);
+      return { drug_code: drugCode, status: "OK" };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "parse failed";
+      await sb
+        .from("dpd_pm_cache")
+        .update({
+          cache_status: "PARSE_FAIL" as CacheStatus,
+          cache_error: msg,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("drug_code", drugCode);
+      return { drug_code: drugCode, status: "FAIL", error: msg };
     }
-    console.log(`[pm_prefetch] code=${drugCode} openai done, updating cache`);
-    await sb
-      .from("dpd_pm_cache")
-      .update({
-        cache_status: "OK" as CacheStatus,
-        parsed_at: new Date().toISOString(),
-        source_hash: hash,
-        extracted_json: extracted,
-        extracted_text: null,
-        cache_error: null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("drug_code", drugCode);
-
-    return { drug_code: drugCode, status: "OK" };
   } catch (e) {
     const msg = e instanceof Error ? e.message : "unknown error";
-    await sb
-      .from("dpd_pm_cache")
-      .update({
-        cache_status: "PARSE_FAIL" as CacheStatus,
-        cache_error: msg,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("drug_code", drugCode);
     return { drug_code: drugCode, status: "FAIL", error: msg };
   }
 }
@@ -492,25 +519,39 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
       return json(400, { status: "ERROR", message: "drug_code(s) required" });
     }
 
-    const seed = await pickSeedDrugCode(codes);
-    const detail = await prefetchOne(seed);
-    const ok = detail.status === "OK" ? 1 : 0;
-    const noPdf = detail.status === "NO_PDF" ? 1 : 0;
-    const fail = detail.status === "FAIL" ? 1 : 0;
+    const ordered = await pickCandidateOrder(codes);
+    const maxTries = Math.min(ordered.length, 6);
+    const attempts: PrefetchDetail[] = [];
 
-    // Kick off background warm-cache (does NOT block response)
-    triggerWorker(seed, codes.map((c) => String(c).trim()).filter(Boolean));
+    for (let i = 0; i < maxTries; i++) {
+      const code = ordered[i];
+      const detail = await prefetchOne(code);
+      attempts.push(detail);
+      if (detail.status === "OK") {
+        return json(200, {
+          status: "OK",
+          message: "Monograph ready",
+          total_tried: attempts.length,
+          ok: 1,
+          no_pdf: 0,
+          fail: 0,
+          details: [detail],
+          attempts,
+        });
+      }
+    }
 
-    console.log(`[pm_prefetch] seed=${seed} total=1 ok=${ok} no_pdf=${noPdf} fail=${fail}`);
-
+    const noPdf = attempts.filter((a) => a.status === "NO_PDF").length;
+    const fail = attempts.filter((a) => a.status === "FAIL").length;
     return json(200, {
       status: "OK",
-      message: "Prefetch started",
-      total: 1,
-      ok,
+      message: "No usable Product Monograph found for provided drug_codes.",
+      total_tried: attempts.length,
+      ok: 0,
       no_pdf: noPdf,
       fail,
-      details: [detail],
+      details: [attempts[0] ?? { drug_code: ordered[0], status: "FAIL", error: "No attempts" }],
+      attempts,
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "unknown error";

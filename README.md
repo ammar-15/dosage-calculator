@@ -54,8 +54,7 @@ The calculation engine:
 
 - Pulls the drug record from the DPD-based API
 - Reads dosing guidance from the product monograph
-- Applies:
-   - Indication-specific adjustments based on patient details
+- Applies Indication-specific adjustments based on patient details
 - Validates last dose timing
 - Returns one direct next-dose recommendation
 

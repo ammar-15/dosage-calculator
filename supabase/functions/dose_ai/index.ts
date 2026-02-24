@@ -100,27 +100,38 @@ function plausibilityGate(body: DoseReq): PlausibilityGate {
 function isUsableExtractedJson(v: any): boolean {
   if (!v || typeof v !== "object") return false;
 
-  const hasOld =
-    (Array.isArray(v.rules) && v.rules.length > 0) ||
-    (Array.isArray(v.tables) && v.tables.length > 0) ||
-    (Array.isArray(v.sections) && v.sections.length > 0);
+  const hasRules = Array.isArray(v.rules) && v.rules.length > 0;
+  const hasTables = Array.isArray(v.tables) && v.tables.length > 0;
+  const hasSections = Array.isArray(v.sections) && v.sections.length > 0;
 
   const hasDosing =
-    !!v.dosing &&
-    typeof v.dosing === "object" &&
-    ((Array.isArray(v.dosing?.intravenous) &&
+    v.dosing &&
+    (Array.isArray(v.dosing.oral) ||
+      Array.isArray(v.dosing.intravenous) ||
+      Array.isArray(v.dosing.other_routes));
+
+  const hasAnyDosingRows =
+    (Array.isArray(v?.dosing?.oral) && v.dosing.oral.length > 0) ||
+    (Array.isArray(v?.dosing?.intravenous) &&
       v.dosing.intravenous.length > 0) ||
-      (Array.isArray(v.dosing?.oral) && v.dosing.oral.length > 0) ||
-      (Array.isArray(v.dosing?.other_routes) &&
-        v.dosing.other_routes.length > 0));
+    (Array.isArray(v?.dosing?.other_routes) &&
+      v.dosing.other_routes.length > 0);
 
-  const hasSafety =
-    (Array.isArray(v.max_dose_limits) && v.max_dose_limits.length > 0) ||
-    (Array.isArray(v.contraindications) && v.contraindications.length > 0) ||
-    (v.renal_adjustment && typeof v.renal_adjustment === "object") ||
-    (v.hepatic_adjustment && typeof v.hepatic_adjustment === "object");
+  const hasCaps =
+    Array.isArray(v.max_dose_limits) && v.max_dose_limits.length > 0;
+  const hasMonitoring =
+    Array.isArray(v.monitoring_requirements) &&
+    v.monitoring_requirements.length > 0;
 
-  return hasOld || hasDosing || hasSafety;
+  return (
+    hasRules ||
+    hasTables ||
+    hasSections ||
+    hasDosing ||
+    hasAnyDosingRows ||
+    hasCaps ||
+    hasMonitoring
+  );
 }
 
 function parseJsonFromContent(content: string): any {
@@ -200,38 +211,87 @@ async function computeFromMonograph(
 You are given extracted_json from a Canadian Product Monograph (already structured).
 
 Goal: compute next dose (mg), interval (hours), and next eligible time using ONLY extracted_json.
-Do NOT invent numbers. If required info is missing, return WARN.
+Do NOT invent numbers.
 
-How to use extracted_json (priority):
-1) dosing (most important):
-   - dosing.intravenous[]
-   - dosing.oral[]
-   - dosing.other_routes[]
-2) max_dose_limits (caps like "should not exceed 2 g/day")
-3) renal_adjustment / hepatic_adjustment / monitoring_requirements
-4) administration_constraints (infusion rate, duration)
-5) contraindications, interactions, adverse reactions (for WARN notes)
+------------------------------------------------
+STEP 0 — CLINICAL FLAGS FROM patient_notes (IMPORTANT)
+------------------------------------------------
+Before selecting a dose, infer these flags from patient_notes using keyword matching.
+Treat these as TRUE if ANY keyword appears (case-insensitive):
 
-Population matching:
-- Determine population from age_years:
-  neonate (<1 month), infant (<1 year), child (1–11), adolescent (12–17), adult (>=18)
-- Prefer dosing rows whose "population" matches.
-- If multiple routes exist, select the route that best matches patient_notes (e.g. "oral", "IV", "intravenous"). If unclear, WARN.
+RENAL_FLAG keywords:
+"renal", "kidney", "ckd", "chronic kidney", "nephro", "eGFR", "creatinine clearance", "CrCl", "dialysis", "uremia"
 
-Dose selection:
-- If mg/kg exists, calculate using weight_kg.
-- If multiple adult fixed regimens exist, choose the one with the clearest matching indication/route text; otherwise choose the lower total daily exposure.
-- If any max_dose_limits apply to the matched population, ensure the computed regimen does not exceed it.
-  If it would exceed, return WARN and do not output a dose.
+HEPATIC_FLAG keywords:
+"hepatic", "liver", "cirrhosis", "hepatitis", "ALT", "AST", "bilirubin"
 
-Reasoning output requirement:
-patient_specific_notes must include:
-- matched route + population
-- the exact dosing row text you used (short)
-- any max daily cap applied (short)
-- any renal/hepatic adjustment warning if relevant
+RESP_FLAG keywords (smoking / lung disease):
+"smoker", "smoking", "COPD", "asthma", "bronchitis", "emphysema", "lung disease", "shortness of breath", "wheeze"
 
-Return JSON ONLY with this schema:
+PREG_FLAG keywords:
+"pregnant", "pregnancy", "breastfeeding", "lactation"
+
+If patient_notes are empty, all flags are FALSE.
+
+------------------------------------------------
+STEP 1 — FIND RELEVANT MONOGRAPH SAFETY CONTENT (SYNONYM-AWARE)
+------------------------------------------------
+Even if extracted_json does NOT have renal_adjustment/hepatic_adjustment fields,
+you MUST search ALL of extracted_json (any text fields, sections_summary, max_dose_limits,
+monitoring_requirements, special_populations_notes, contraindications, administration_constraints)
+for safety/adjustment language using synonym matching.
+
+Renal adjustment synonym phrases (examples):
+"impaired renal function", "renal insufficiency", "decreased renal clearance",
+"dosage adjustment required", "reduce dose", "extend interval", "monitor serum levels",
+"avoid toxic levels", "accumulation", "nephrotoxicity"
+
+Respiratory risk / monitoring synonym phrases:
+"respiratory", "pulmonary", "wheezing", "dyspnea", "bronchospasm", "COPD", "asthma",
+and any explicit "monitor" guidance that mentions respiratory status or related parameters.
+
+If RENAL_FLAG is TRUE:
+- If extracted_json contains ANY renal warning/monitoring language, include it in patient_specific_notes.
+- If extracted_json contains NO numeric renal dose change, you MUST still return the best explicit STANDARD regimen,
+  set status="WARN", and state: "Renal impairment noted; monograph provides monitoring/caution but no numeric adjustment."
+
+If RESP_FLAG is TRUE:
+- Include any monograph monitoring requirements or adverse reaction risks that relate to respiratory symptoms
+  IF they exist in extracted_json (do not invent). If none exist, do not add respiratory claims.
+
+------------------------------------------------
+STEP 2 — DOSE SELECTION (ROUTE + POPULATION)
+------------------------------------------------
+Priority order:
+1) population_specific_dosing (if present and non-empty)
+2) dosing.* arrays (oral / intravenous / other_routes)
+3) max_dose_limits
+4) monitoring_requirements / special_populations_notes / contraindications / administration_constraints
+
+Population:
+neonate (<1 month), infant (<1 year), child (1–11), adolescent (12–17), adult (>=18)
+
+Route selection:
+- Choose route by patient_notes keywords ("oral", "capsule", "PO", "IV", "intravenous", "infusion").
+- If multiple routes exist and route is unclear, set status="WARN" but still choose the lowest-risk explicit regimen.
+
+Dose math rules:
+- If mg/kg exists, calculate using weight_kg (if missing -> WARN + null).
+- If "in 3 or 4 divided doses" and no interval is stated, use 4 divided doses (interval_hours = 24/4 = 6),
+  unless extracted_json explicitly forces 3 only.
+- If fixed-dose options exist, choose the lower total daily exposure unless indication/route text clearly matches the other.
+
+Max dose caps:
+- If a cap applies (e.g., "total daily dose should not exceed 2 g"), enforce it.
+- If you cannot enforce it safely (missing divided dose count or missing interval), return WARN + null.
+
+Next eligible time:
+- If last_dose_time and interval_hours exist, next_eligible_time = last_dose_time + interval_hours.
+
+------------------------------------------------
+OUTPUT REQUIREMENTS (STRICT)
+------------------------------------------------
+Return JSON ONLY:
 {
   "status": "OK"|"WARN",
   "message": string,
@@ -241,6 +301,13 @@ Return JSON ONLY with this schema:
   "patient_specific_notes": string|null,
   "ai_summary": string
 }
+
+patient_specific_notes MUST include:
+- matched route + population
+- exact dosing row used (short quote)
+- any max daily cap referenced (short quote)
+- if RENAL_FLAG: include monograph renal caution/monitoring text if present; otherwise say "no renal guidance found in monograph"
+- if RESP_FLAG: include monograph respiratory-related monitoring/risk text only if present
 
 Patient:
 weight_kg=${asNumber(body.weight_kg)}

@@ -65,7 +65,24 @@ async function mustOk<T>(q: Promise<DbResult<T>>, label: string): Promise<T> {
 }
 
 function isUsableExtractedJson(v: any): boolean {
-  return !!v && Array.isArray(v?.rules) && v.rules.length > 0;
+  if (!v || typeof v !== "object") return false;
+
+  // New schema: evidence blocks
+  const hasEvidence =
+    Array.isArray((v as any)?.evidence_blocks) &&
+    (v as any).evidence_blocks.length > 0;
+
+  // Backward compatibility (in case old rows exist)
+  const hasDosing =
+    !!(v as any)?.dosing &&
+    (Array.isArray((v as any)?.dosing?.oral) ||
+      Array.isArray((v as any)?.dosing?.intravenous) ||
+      Array.isArray((v as any)?.dosing?.other_routes));
+
+  const hasRules =
+    Array.isArray((v as any)?.rules) && (v as any).rules.length > 0;
+
+  return hasEvidence || hasDosing || hasRules;
 }
 
 function isJsonObject(v: any): boolean {
@@ -95,35 +112,50 @@ async function quickPdfHeaderCheck(url: string) {
 
 async function openaiExtractPdfToJson(pmUrl: string) {
   const prompt = `
-You are extracting structured clinical data from a Canadian Product Monograph PDF.
+You are extracting dosing-critical information from a Canadian Product Monograph PDF.
 
-Your goal is to capture ALL clinically relevant structured data needed for:
+Goal: Return a SIMPLE, FAST, RELIABLE JSON that does NOT miss critical dosing details.
 
-- Dose calculation
-- Population-specific dosing
-- Renal/hepatic adjustment
-- Contraindications
-- Maximum dose limits
-- Monitoring requirements
-- Adverse reactions
-- Drug interactions
-- Administration constraints
+COVERAGE QUOTA (MANDATORY):
+You MUST output evidence_blocks for ALL of the following categories IF they exist anywhere in the PDF.
+Do not stop early after finding dosing.
+
+Required block minimums:
+- 1 block: CONTRAINDICATIONS
+- 2 blocks: WARNINGS AND PRECAUTIONS (at least one must mention renal/nephrotoxicity/serum levels if present)
+- 1 block: DRUG INTERACTIONS
+- 1 block: ADVERSE REACTIONS (or "ADVERSE REACTIONS/Events")
+- 1 block: MONITORING (serum levels/troughs/renal labs) if present
+- 2 blocks: DOSAGE AND ADMINISTRATION (adult IV + pediatric or oral if present)
+- 1 block: Renal dosing nomogram OR creatinine clearance formula if present
+- 1 block: SPECIAL POPULATIONS (geriatrics/renal impairment/dialysis) if present
+
+If a required section truly does not exist, omit it (do NOT invent).
+
+CRITICAL SECTIONS (must be captured if present):
+- DOSAGE AND ADMINISTRATION (including renal dosing, formulas, nomograms, tables)
+- WARNINGS AND PRECAUTIONS (renal/ototoxicity, monitoring, serum levels)
+- CONTRAINDICATIONS
+- DRUG INTERACTIONS
+- ADMINISTRATION constraints (infusion rate, minimum infusion time, dilution, etc.)
+- SPECIAL POPULATIONS (geriatrics, renal impairment, dialysis)
 
 STRICT RULES:
 - Do NOT invent information.
-- Only extract what is explicitly stated in the PDF.
-- Preserve numeric values exactly as written.
-- Preserve units exactly as written (mg, mg/kg, g/day, mL/min, etc.).
-- Capture max dose caps exactly as written (e.g., "should not exceed 2 g per day").
-- Capture renal/hepatic exceptions even if embedded inside dosing paragraphs.
-- Capture infusion rate restrictions (e.g., "no more than 10 mg/min").
+- Extract only what is explicitly stated in the PDF.
+- Preserve numeric values and units exactly as written.
 
-PRIORITY:
-Dosing and safety exceptions are highest priority.
+IMPORTANT (NOMOGRAM/CHART RULE):
+- If the PDF contains a dosing nomogram/graph/chart (image), you MUST extract:
+  1) chart title (if any)
+  2) x-axis label + units
+  3) y-axis label + units
+  4) at least 6 anchor points read from the printed ticks/grid (x,y pairs)
+- Do NOT derive formulas. Do NOT “estimate” beyond the printed chart.
 
-OUTPUT JSON ONLY.
+OUTPUT JSON ONLY. No markdown. No commentary.
 
-Schema:
+Schema (keep it small):
 
 {
   "meta": {
@@ -131,80 +163,41 @@ Schema:
     "pm_date": "",
     "source_pages": 0
   },
-
-  "dosing": {
-    "intravenous": [],
-    "oral": [],
-    "other_routes": []
-  },
-
-  "population_specific_dosing": {
-    "adults": [],
-    "children": [],
-    "infants": [],
-    "neonates": [],
-    "geriatrics": []
-  },
-
-  "renal_adjustment": {
-    "dose_adjustments": [],
-    "monitoring_requirements": [],
-    "warnings": []
-  },
-
-  "hepatic_adjustment": {
-    "dose_adjustments": [],
-    "warnings": []
-  },
-
-  "max_dose_limits": [
-    {
-      "population": "",
-      "limit_text": "",
-      "numeric_value": "",
-      "unit": ""
-    }
-  ],
-
-  "contraindications": [],
-
-  "boxed_warnings": [],
-
-  "monitoring_requirements": [],
-
-  "administration_constraints": [
-    {
-      "type": "infusion_rate|dilution|duration|other",
-      "text": ""
-    }
-  ],
-
-  "adverse_reactions": {
-    "common": [],
-    "serious": []
-  },
-
-  "drug_interactions": [],
-
-  "special_populations_notes": [],
-
-  "sections_summary": [
+  "evidence_blocks": [
     {
       "heading": "",
-      "short_summary": ""
+      "page": 0,
+      "type": "dosing|renal_adjustment|hepatic_adjustment|nomogram|monitoring|contraindication|interaction|administration|special_population|warning|other",
+      "text": "",
+      "structured": null
     }
   ]
 }
 
 INSTRUCTIONS:
-- Extract dosing tables as structured entries in dosing arrays.
-- Extract mg/kg and per-day expressions exactly.
-- Extract frequency exactly (e.g., q6h, every 12 hours).
-- Extract divided dose instructions exactly.
-- If text states "total daily dose should not exceed X", add to max_dose_limits.
-- If renal impairment section exists, extract dose modification rules.
-- If therapeutic drug monitoring is mentioned (e.g., trough levels), include it.
-- Extract only clinically relevant content. Do not include marketing or non-clinical text.
+- Each evidence block must contain a clear heading and the exact relevant text.
+- Keep text concise but include all dosing/monitoring numbers.
+- If a renal formula exists (e.g., CrCl estimation), include it verbatim in text and also put a structured object:
+
+Example structured for formulas:
+{
+  "kind": "formula",
+  "name": "Creatinine clearance (CrCl) estimation",
+  "inputs": ["age_years","weight_kg","sex","serum_creatinine"],
+  "notes": "copy exact constraints if present"
+}
+
+- If a nomogram exists, put structured object like:
+
+{
+  "kind": "nomogram_points",
+  "x_axis": { "label": "", "unit": "mL/min" },
+  "y_axis": { "label": "", "unit": "mg/kg/24 h" },
+  "points": [
+    { "x": 10, "y": 5.0 },
+    { "x": 20, "y": 7.5 }
+  ]
+}
 
 Return JSON only.
 `;
@@ -225,7 +218,7 @@ Return JSON only.
         model: "gpt-4o-mini",
         temperature: 0,
         text: { format: { type: "json_object" } },
-        max_output_tokens: 1600,
+        max_output_tokens: 3000,
         input: [
           {
             role: "system",

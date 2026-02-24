@@ -100,6 +100,10 @@ function plausibilityGate(body: DoseReq): PlausibilityGate {
 function isUsableExtractedJson(v: any): boolean {
   if (!v || typeof v !== "object") return false;
 
+  const hasEvidence =
+    Array.isArray((v as any)?.evidence_blocks) &&
+    (v as any).evidence_blocks.length > 0;
+
   const hasRules = Array.isArray(v.rules) && v.rules.length > 0;
   const hasTables = Array.isArray(v.tables) && v.tables.length > 0;
   const hasSections = Array.isArray(v.sections) && v.sections.length > 0;
@@ -124,6 +128,7 @@ function isUsableExtractedJson(v: any): boolean {
     v.monitoring_requirements.length > 0;
 
   return (
+    hasEvidence ||
     hasRules ||
     hasTables ||
     hasSections ||
@@ -152,7 +157,25 @@ function extractMaxDailyMg(extractedJson: unknown): number | null {
   const j: any = extractedJson;
   const candidates: number[] = [];
 
-  // 1) New schema: max_dose_limits
+  // A) New schema: scan evidence_blocks text
+  if (Array.isArray(j?.evidence_blocks)) {
+    for (const b of j.evidence_blocks) {
+      const txt = String(b?.text ?? "").toLowerCase();
+      if (!txt) continue;
+
+      // look for "should not exceed" / "max" + daily/day
+      if (!txt.includes("day") && !txt.includes("daily")) continue;
+
+      for (const m of txt.matchAll(/(\d+(?:\.\d+)?)\s*g(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g)) {
+        candidates.push(Number(m[1]) * 1000);
+      }
+      for (const m of txt.matchAll(/(\d+(?:\.\d+)?)\s*mg(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g)) {
+        candidates.push(Number(m[1]));
+      }
+    }
+  }
+
+  // B) Backward compatible: max_dose_limits
   if (Array.isArray(j?.max_dose_limits)) {
     for (const lim of j.max_dose_limits) {
       const unit = String(lim?.unit ?? "").toLowerCase();
@@ -163,7 +186,7 @@ function extractMaxDailyMg(extractedJson: unknown): number | null {
     }
   }
 
-  // 2) New schema: dosing.*.max_daily_dose like "2 g"
+  // C) Backward compatible: dosing max_daily_dose fields
   const dosingLists = [
     ...(j?.dosing?.oral ?? []),
     ...(j?.dosing?.intravenous ?? []),
@@ -176,27 +199,6 @@ function extractMaxDailyMg(extractedJson: unknown): number | null {
     const mg = txt.match(/(\d+(?:\.\d+)?)\s*mg/);
     if (g) candidates.push(Number(g[1]) * 1000);
     if (mg) candidates.push(Number(mg[1]));
-  }
-
-  // 3) Old schema fallback: rules.then.notes
-  const rules = j?.rules;
-  if (Array.isArray(rules)) {
-    for (const rule of rules) {
-      const txt = String(rule?.then?.notes ?? "").toLowerCase();
-      if (!txt) continue;
-      if (!txt.includes("day") && !txt.includes("daily")) continue;
-
-      for (const m of txt.matchAll(
-        /(\d+(?:\.\d+)?)\s*g(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g,
-      )) {
-        candidates.push(Number(m[1]) * 1000);
-      }
-      for (const m of txt.matchAll(
-        /(\d+(?:\.\d+)?)\s*mg(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g,
-      )) {
-        candidates.push(Number(m[1]));
-      }
-    }
   }
 
   if (!candidates.length) return null;

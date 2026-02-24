@@ -401,7 +401,7 @@ ${JSON.stringify(extractedJson)}
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
+      model: "gpt-4.1-nano",
       temperature: 0.1,
       messages: [{ role: "user", content: prompt }],
     }),

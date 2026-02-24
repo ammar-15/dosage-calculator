@@ -9,10 +9,6 @@ function getEnv(name: string): string {
   throw new Error(`Missing env: ${name}`);
 }
 
-const PROJECT_URL = getEnv("PROJECT_URL");
-const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
-const sb = createClient(PROJECT_URL, SERVICE_KEY);
-
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
@@ -37,6 +33,10 @@ serve(async (req) => {
   }
 
   try {
+    const PROJECT_URL = getEnv("PROJECT_URL");
+    const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
+    const sb = createClient(PROJECT_URL, SERVICE_KEY);
+
     const body = await req.json().catch(() => ({}));
 
     const drugName = String(body?.drug_name ?? "").trim();

@@ -24,12 +24,6 @@ function getEnv(name: string): string {
   throw new Error(`Missing env: ${name}`);
 }
 
-const PROJECT_URL = getEnv("PROJECT_URL");
-const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
-const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
-
-const sb = createClient(PROJECT_URL, SERVICE_KEY);
-
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
@@ -110,7 +104,7 @@ async function quickPdfHeaderCheck(url: string) {
   if (!isPdf) throw new Error("Not a valid PDF");
 }
 
-async function openaiExtractPdfToJson(pmUrl: string) {
+async function openaiExtractPdfToJson(pmUrl: string, OPENAI_API_KEY: string) {
   const prompt = `
 You are extracting dosing-critical information from a Canadian Product Monograph PDF.
 
@@ -285,6 +279,11 @@ export async function pmPrefetchHandler(req: {
   json: () => Promise<PrefetchReq>;
 }) {
   try {
+    const PROJECT_URL = getEnv("PROJECT_URL");
+    const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
+    const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
+    const sb = createClient(PROJECT_URL, SERVICE_KEY);
+
     const body = (await req.json().catch(() => ({}))) as PrefetchReq;
     const drugCode = String(body.drug_code ?? "").trim();
     if (!drugCode) {
@@ -448,7 +447,7 @@ export async function pmPrefetchHandler(req: {
     );
 
     try {
-      const extracted = await openaiExtractPdfToJson(pmUrl);
+      const extracted = await openaiExtractPdfToJson(pmUrl, OPENAI_API_KEY);
 
       await mustWrite(
         sb

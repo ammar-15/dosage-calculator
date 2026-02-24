@@ -17,6 +17,8 @@ type DoseResp = {
   interval_hours: number | null;
   next_eligible_time: string | null;
   max_daily_mg: number | null;
+  max_daily_cap_quote: string | null;
+  max_daily_cap_page: number | null;
   assumptions: string[] | null;
   patient_specific_notes: string | null;
   ai_summary: string | null;
@@ -34,8 +36,6 @@ function getEnv(name: string): string {
   if (typeof procVal === "string" && procVal) return procVal;
   throw new Error(`Missing env: ${name}`);
 }
-
-const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -207,9 +207,30 @@ function extractMaxDailyMg(extractedJson: unknown): number | null {
   return Math.min(...candidates);
 }
 
+function trustAiDailyCap(calc: any): number | null {
+  const n = typeof calc?.max_daily_mg === "number" ? calc.max_daily_mg : null;
+  const q =
+    typeof calc?.max_daily_cap_quote === "string"
+      ? calc.max_daily_cap_quote.toLowerCase()
+      : "";
+  const p = typeof calc?.max_daily_cap_page === "number" ? calc.max_daily_cap_page : null;
+
+  if (n === null) return null;
+  if (!q) return null;
+
+  const hasUnits = /\b\d+(\.\d+)?\s*(mg|g)\b/i.test(q);
+  const hasDaily = /(per day|daily|24[-\s]?hour|in 24 hours|a day)/i.test(q);
+
+  if (!hasUnits || !hasDaily) return null;
+  if (p === null) return null;
+
+  return n;
+}
+
 async function computeFromMonograph(
   body: DoseReq,
   extractedJson: unknown,
+  OPENAI_API_KEY: string,
 ): Promise<DoseResp> {
   const prompt = `
 You are given extracted_json from a Canadian Product Monograph (already structured).
@@ -301,9 +322,35 @@ Dose math rules:
 - If fixed-dose options exist, choose the lower total daily exposure unless indication/route text clearly matches the other.
 - If dosing requires lab values (CrCl/SCr/levels) and they are not provided AND no explicit numeric fallback exists, return WARN and standard regimen only.
 
-Max dose caps:
-- If a cap applies (e.g., "total daily dose should not exceed x amount in g"), enforce it.
-- If you cannot enforce it safely (missing divided dose count or missing interval), return WARN + null.
+------------------------------------------------
+MAX DAILY CAP HANDLING (MUST SELF-CORRECT)
+------------------------------------------------
+If you find an explicit maximum daily dose cap in extracted_json, you MUST:
+
+1) Provide it as:
+   - max_daily_mg (number)
+   - max_daily_cap_quote (exact short quote)
+   - max_daily_cap_page (page number if available)
+   Only set these if the quote explicitly states daily/day/24-hour maximum.
+
+2) Build a list of candidate explicit regimens from evidence_blocks (dose + interval).
+   Example candidates:
+   - 500 mg every 6 hours
+   - 1 g every 12 hours
+   - 10 mg/kg every 6 hours (requires weight)
+
+3) Select a candidate regimen that DOES NOT exceed the max daily cap.
+   - Prefer an explicitly stated alternative regimen over inventing a new interval.
+   - You may choose the lower total daily exposure regimen if both are explicit.
+   - Do NOT "reduce dose" unless that reduced dose is explicitly stated in the monograph.
+
+4) If NO explicit candidate regimen can satisfy the cap:
+   - If patient already took >= max_daily_mg within the last 24h (based on last_dose_mg only if you can safely interpret it), return:
+     suggested_next_dose_mg = 0
+     interval_hours = null
+     next_eligible_time = null
+     message must say: "Max daily dose already reached; no additional dose recommended within 24 hours per monograph cap."
+   - Otherwise return WARN with the safest explicit regimen and explain the conflict.
 
 Next eligible time:
 - If last_dose_time and interval_hours exist, next_eligible_time = last_dose_time + interval_hours.
@@ -319,6 +366,8 @@ Return JSON ONLY:
   "interval_hours": number|null,
   "next_eligible_time": string|null,
   "max_daily_mg": number|null,
+  "max_daily_cap_quote": string|null,
+  "max_daily_cap_page": number|null,
   "assumptions": string[],
   "patient_specific_notes": string|null,
   "ai_summary": string
@@ -330,6 +379,8 @@ patient_specific_notes MUST include:
 - any max daily cap referenced (short quote)
 - if RENAL_FLAG: include monograph renal caution/monitoring text if present; otherwise say "no renal guidance found in monograph"
 - if RESP_FLAG: include monograph respiratory-related monitoring/risk text only if present
+- If no renal impairment keywords and no labs provided → add assumption: "Assumed normal renal function (no renal impairment provided)."
+- If dialysis not mentioned → assumption: "Assumed not on dialysis (not mentioned)."
 
 Patient:
 weight_kg=${asNumber(body.weight_kg)}
@@ -393,6 +444,14 @@ ${JSON.stringify(extractedJson)}
         : null,
     max_daily_mg:
       typeof parsed?.max_daily_mg === "number" ? parsed.max_daily_mg : null,
+    max_daily_cap_quote:
+      typeof parsed?.max_daily_cap_quote === "string"
+        ? parsed.max_daily_cap_quote
+        : null,
+    max_daily_cap_page:
+      typeof parsed?.max_daily_cap_page === "number"
+        ? parsed.max_daily_cap_page
+        : null,
     assumptions: Array.isArray(parsed?.assumptions)
       ? parsed.assumptions.map(String)
       : null,
@@ -405,7 +464,10 @@ ${JSON.stringify(extractedJson)}
   };
 }
 
-export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
+export async function doseAiHandler(
+  req: { json: () => Promise<DoseReq> },
+  OPENAI_API_KEY: string,
+) {
   try {
     const body = await req.json();
     const gate = plausibilityGate(body);
@@ -422,7 +484,11 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       });
     }
 
-    const calc = await computeFromMonograph(body, body.extracted_json);
+    const calc = await computeFromMonograph(
+      body,
+      body.extracted_json,
+      OPENAI_API_KEY,
+    );
 
     let nextEligible = calc.next_eligible_time;
     if (!nextEligible && calc.interval_hours && body.last_dose_time) {
@@ -449,11 +515,8 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       });
     }
 
-    const aiMaxDaily = (calc as any)?.max_daily_mg ?? null;
-    const maxDailyMg =
-      typeof aiMaxDaily === "number"
-        ? aiMaxDaily
-        : extractMaxDailyMg(body.extracted_json);
+    const trustedAiCap = trustAiDailyCap(calc);
+    const maxDailyMg = trustedAiCap ?? extractMaxDailyMg(body.extracted_json);
     if (
       maxDailyMg !== null &&
       calc.suggested_next_dose_mg !== null &&
@@ -463,14 +526,39 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       const estimatedDaily =
         calc.suggested_next_dose_mg * (24 / calc.interval_hours);
       if (estimatedDaily > maxDailyMg) {
+        const lastDose = asNumber(body.last_dose_mg);
+        if (lastDose !== null && lastDose >= maxDailyMg) {
+          return json(200, {
+            status: "WARN",
+            message:
+              "Max daily dose already reached/exceeded; no additional dose eligible within 24 hours per monograph cap.",
+            suggested_next_dose_mg: 0,
+            interval_hours: null,
+            next_eligible_time: null,
+            max_daily_mg: maxDailyMg,
+            max_daily_cap_quote: calc.max_daily_cap_quote,
+            max_daily_cap_page: calc.max_daily_cap_page,
+            assumptions: (calc as any)?.assumptions ?? [],
+            patient_specific_notes:
+              (calc.patient_specific_notes ?? "") +
+              ` Cap used: ${maxDailyMg} mg/day.`,
+            ai_summary: calc.ai_summary ?? "Cap reached; next dose set to 0.",
+          });
+        }
+
         return json(200, {
           status: "WARN",
-          message: "Computed regimen exceeds monograph max daily limit.",
-          suggested_next_dose_mg: null,
-          interval_hours: null,
-          next_eligible_time: null,
-          patient_specific_notes: null,
-          ai_summary: "Computed regimen exceeds monograph max daily limit.",
+          message:
+            "Computed regimen appears to exceed monograph max daily limit; verify. Returning best explicit regimen.",
+          suggested_next_dose_mg: calc.suggested_next_dose_mg,
+          interval_hours: calc.interval_hours,
+          next_eligible_time: nextEligible,
+          max_daily_mg: maxDailyMg,
+          max_daily_cap_quote: calc.max_daily_cap_quote,
+          max_daily_cap_page: calc.max_daily_cap_page,
+          assumptions: (calc as any)?.assumptions ?? [],
+          patient_specific_notes: calc.patient_specific_notes,
+          ai_summary: calc.ai_summary,
         });
       }
     }
@@ -492,6 +580,10 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       suggested_next_dose_mg: calc.suggested_next_dose_mg,
       interval_hours: calc.interval_hours,
       next_eligible_time: nextEligible,
+      max_daily_mg: maxDailyMg,
+      max_daily_cap_quote: calc.max_daily_cap_quote,
+      max_daily_cap_page: calc.max_daily_cap_page,
+      assumptions: calc.assumptions,
       patient_specific_notes: finalPatientNotes,
       ai_summary: calc.ai_summary ?? "Dose computed from monograph data.",
     });
@@ -511,9 +603,27 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
 
 export default doseAiHandler;
 
-serve((req) => {
+serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { status: 200, headers: corsHeaders });
   }
-  return doseAiHandler({ json: () => req.json() });
+
+  try {
+    const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
+    return await doseAiHandler(
+      { json: () => req.json() },
+      OPENAI_API_KEY,
+    );
+  } catch (e) {
+    console.error("dose_ai error:", e);
+    return json(500, {
+      status: "WARN",
+      message: e instanceof Error ? e.message : "AI dose calculation failed",
+      suggested_next_dose_mg: null,
+      interval_hours: null,
+      next_eligible_time: null,
+      patient_specific_notes: null,
+      ai_summary: "AI explanation unavailable.",
+    });
+  }
 });

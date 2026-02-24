@@ -137,9 +137,9 @@ export default function DoseValidatorScreen() {
   );
   const [, setSelectedDrugCode] = useState<string | null>(null);
   const [, setSelectedDrugCodes] = useState<string[]>([]);
-  const [selectedExtractedJson, setSelectedExtractedJson] = useState<any | null>(
-    null,
-  );
+  const [selectedExtractedJson, setSelectedExtractedJson] = useState<
+    any | null
+  >(null);
   const [pmCacheStatus, setPmCacheStatus] = useState<
     "idle" | "loading" | "ok" | "no_pdf" | "fail"
   >("idle");
@@ -317,7 +317,9 @@ export default function DoseValidatorScreen() {
       }
 
       if (status === "NEEDS_PREFETCH") {
-        const codeToFetch = String(resolver.data?.drug_code ?? fallbackCode).trim();
+        const codeToFetch = String(
+          resolver.data?.drug_code ?? fallbackCode,
+        ).trim();
         if (!codeToFetch) {
           setPmCacheStatus("fail");
           setPmCacheMessage(`Monographs (0/${codes.length})`);
@@ -335,7 +337,10 @@ export default function DoseValidatorScreen() {
           return;
         }
 
-        if (String(prefetch.data?.status ?? "").toUpperCase() === "OK" && prefetch.data?.extracted_json) {
+        if (
+          String(prefetch.data?.status ?? "").toUpperCase() === "OK" &&
+          prefetch.data?.extracted_json
+        ) {
           setSelectedExtractedJson(prefetch.data.extracted_json);
           setPmCounts({ ok: 1, noPdf: 0, fail: 0, total: codes.length });
           setPmCacheStatus("ok");
@@ -368,19 +373,22 @@ export default function DoseValidatorScreen() {
       return;
     }
 
-    const { data, error: invokeError } = await supabase.functions.invoke("dose_ai", {
-      body: {
-        patient_name: values.patientName,
-        weight_kg: values.weightKg ? Number(values.weightKg) : null,
-        age_years: values.ageYears ? Number(values.ageYears) : null,
-        gender: values.gender ?? null,
-        extracted_json: selectedExtractedJson,
-        drug_name: values.drugName ?? "",
-        last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
-        last_dose_time: lastTakenDate?.toISOString() ?? null,
-        patient_notes: values.notes ?? null,
+    const { data, error: invokeError } = await supabase.functions.invoke(
+      "dose_ai",
+      {
+        body: {
+          patient_name: values.patientName,
+          weight_kg: values.weightKg ? Number(values.weightKg) : null,
+          age_years: values.ageYears ? Number(values.ageYears) : null,
+          gender: values.gender ?? null,
+          extracted_json: selectedExtractedJson,
+          drug_name: values.drugName ?? "",
+          last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
+          last_dose_time: lastTakenDate?.toISOString() ?? null,
+          patient_notes: values.notes ?? null,
+        },
       },
-    });
+    );
 
     setAiLoading(false);
 
@@ -391,6 +399,8 @@ export default function DoseValidatorScreen() {
       });
       return;
     }
+    console.log("dose_ai invokeError:", invokeError);
+    console.log("dose_ai data:", data);
 
     const ruleResult: GuardrailsResult = {
       status: (data?.status as GuardrailsResult["status"]) ?? "WARN",

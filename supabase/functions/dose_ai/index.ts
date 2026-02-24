@@ -16,6 +16,8 @@ type DoseResp = {
   suggested_next_dose_mg: number | null;
   interval_hours: number | null;
   next_eligible_time: string | null;
+  max_daily_mg: number | null;
+  assumptions: string[] | null;
   patient_specific_notes: string | null;
   ai_summary: string | null;
 };
@@ -253,38 +255,54 @@ Respiratory risk / monitoring synonym phrases:
 and any explicit "monitor" guidance that mentions respiratory status or related parameters.
 
 If RENAL_FLAG is TRUE:
-- If extracted_json contains ANY renal warning/monitoring language, include it in patient_specific_notes.
-- If extracted_json contains NO numeric renal dose change, you MUST still return the best explicit STANDARD regimen,
-  set status="WARN", and state: "Renal impairment noted; monograph provides monitoring/caution but no numeric adjustment."
+- Search extracted_json (especially evidence_blocks) for any explicit numeric renal dose/interval adjustment.
+- If numeric renal adjustment is found, apply it.
+- If NO numeric renal adjustment is found:
+  - Return the best explicit STANDARD regimen from the monograph (do not invent an adjustment)
+  - status="WARN"
+  - In patient_specific_notes, explicitly say:
+    "Renal impairment mentioned in patient_notes; no explicit numeric renal adjustment found in monograph extraction; standard regimen shown."
+If RENAL_FLAG is FALSE:
+- Assume general dosing scenario unless monograph itself restricts it.
+- In patient_specific_notes, explicitly say:
+  "No renal impairment mentioned in patient_notes; used general adult dosing."
 
 If RESP_FLAG is TRUE:
 - Include any monograph monitoring requirements or adverse reaction risks that relate to respiratory symptoms
   IF they exist in extracted_json (do not invent). If none exist, do not add respiratory claims.
 
 ------------------------------------------------
-STEP 2 — DOSE SELECTION (ROUTE + POPULATION)
+STEP 2 — DOSE SELECTION (EVIDENCE_BLOCKS FIRST)
 ------------------------------------------------
-Priority order:
-1) population_specific_dosing (if present and non-empty)
-2) dosing.* arrays (oral / intravenous / other_routes)
-3) max_dose_limits
-4) monitoring_requirements / special_populations_notes / contraindications / administration_constraints
+You MUST treat extracted_json.evidence_blocks as the PRIMARY source of truth.
+
+Find candidate dosing regimens by scanning evidence_blocks where:
+- type is "dosing" OR heading contains synonyms of dosing/admin (dosage, administration, posology)
+- include IV/oral keywords in the text itself
+
+If evidence_blocks are present:
+1) pick dosing regimen from evidence_blocks (primary)
+2) only if evidence_blocks are missing/empty, fall back to older schema fields:
+   population_specific_dosing, dosing.*, rules, max_dose_limits
 
 Population:
 neonate (<1 month), infant (<1 year), child (1–11), adolescent (12–17), adult (>=18)
 
 Route selection:
-- Choose route by patient_notes keywords ("oral", "capsule", "PO", "IV", "intravenous", "infusion").
-- If multiple routes exist and route is unclear, set status="WARN" but still choose the lowest-risk explicit regimen.
+- Choose route using BOTH patient_notes and the dosing text.
+- If route unclear, choose the most explicit adult regimen and set status="WARN".
 
 Dose math rules:
 - If mg/kg exists, calculate using weight_kg (if missing -> WARN + null).
+- Only compute mg/kg if the dosing text explicitly contains "mg/kg".
+- If dosing text only contains fixed mg regimens, do not convert to mg/kg.
 - If "in 3 or 4 divided doses" and no interval is stated, use 4 divided doses (interval_hours = 24/4 = 6),
   unless extracted_json explicitly forces 3 only.
 - If fixed-dose options exist, choose the lower total daily exposure unless indication/route text clearly matches the other.
+- If dosing requires lab values (CrCl/SCr/levels) and they are not provided AND no explicit numeric fallback exists, return WARN and standard regimen only.
 
 Max dose caps:
-- If a cap applies (e.g., "total daily dose should not exceed 2 g"), enforce it.
+- If a cap applies (e.g., "total daily dose should not exceed x amount in g"), enforce it.
 - If you cannot enforce it safely (missing divided dose count or missing interval), return WARN + null.
 
 Next eligible time:
@@ -300,6 +318,8 @@ Return JSON ONLY:
   "suggested_next_dose_mg": number|null,
   "interval_hours": number|null,
   "next_eligible_time": string|null,
+  "max_daily_mg": number|null,
+  "assumptions": string[],
   "patient_specific_notes": string|null,
   "ai_summary": string
 }
@@ -371,6 +391,11 @@ ${JSON.stringify(extractedJson)}
       typeof parsed?.next_eligible_time === "string"
         ? parsed.next_eligible_time
         : null,
+    max_daily_mg:
+      typeof parsed?.max_daily_mg === "number" ? parsed.max_daily_mg : null,
+    assumptions: Array.isArray(parsed?.assumptions)
+      ? parsed.assumptions.map(String)
+      : null,
     patient_specific_notes:
       typeof parsed?.patient_specific_notes === "string"
         ? parsed.patient_specific_notes
@@ -424,7 +449,11 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       });
     }
 
-    const maxDailyMg = extractMaxDailyMg(body.extracted_json);
+    const aiMaxDaily = (calc as any)?.max_daily_mg ?? null;
+    const maxDailyMg =
+      typeof aiMaxDaily === "number"
+        ? aiMaxDaily
+        : extractMaxDailyMg(body.extracted_json);
     if (
       maxDailyMg !== null &&
       calc.suggested_next_dose_mg !== null &&

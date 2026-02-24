@@ -17,6 +17,7 @@ type DoseResp = {
   interval_hours: number | null;
   next_eligible_time: string | null;
   patient_specific_notes: string | null;
+  ai_summary: string | null;
 };
 
 type PlausibilityGate = {
@@ -63,17 +64,28 @@ function plausibilityGate(body: DoseReq): PlausibilityGate {
     };
   }
 
-  if (age < 0 || age > 120) return { status: "WARN", message: "Age out of supported range." };
-  if (wt < 1 || wt > 400) return { status: "WARN", message: "Weight out of supported range." };
+  if (age < 0 || age > 120)
+    return { status: "WARN", message: "Age out of supported range." };
+  if (wt < 1 || wt > 400)
+    return { status: "WARN", message: "Weight out of supported range." };
 
   if (age < 2 && wt > 25) {
-    return { status: "WARN", message: "Age/weight combination looks implausible." };
+    return {
+      status: "WARN",
+      message: "Age/weight combination looks implausible.",
+    };
   }
   if (age >= 2 && age <= 10 && wt > 80) {
-    return { status: "WARN", message: "Age/weight combination looks implausible." };
+    return {
+      status: "WARN",
+      message: "Age/weight combination looks implausible.",
+    };
   }
   if (age > 18 && wt < 15) {
-    return { status: "WARN", message: "Weight too low for adult; verify input." };
+    return {
+      status: "WARN",
+      message: "Weight too low for adult; verify input.",
+    };
   }
   if (age > 18 && wt < 25) {
     return { status: "WARN", message: "Low weight for adult; verify input." };
@@ -117,7 +129,9 @@ function extractMaxDailyMg(extractedJson: unknown): number | null {
     if (!txt) continue;
     if (!txt.includes("day") && !txt.includes("daily")) continue;
 
-    const gMatches = txt.matchAll(/(\d+(?:\.\d+)?)\s*g(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g);
+    const gMatches = txt.matchAll(
+      /(\d+(?:\.\d+)?)\s*g(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g,
+    );
     for (const m of gMatches) {
       const n = Number(m[1]);
       if (Number.isFinite(n)) candidates.push(n * 1000);
@@ -155,11 +169,12 @@ DATA USE ORDER:
 
 STRICT:
 - Only output values that are explicitly stated in extracted_json.
-- If you see a range (e.g., 125–500 mg), choose the LOWER bound unless the text indicates otherwise.
-- If interval is a range (6–8h), choose the SHORTER interval unless text indicates otherwise.
+- If you see a range (e.g., 125–500 mg), choose the MIDDLE ground to the nearest 25 unless the text indicates otherwise.
+- If interval is a range (6–8h), choose the MIDDLE interval unless text indicates otherwise.
 - If route-specific dosing exists, match route if provided in text; otherwise leave route unspecified.
 - If dosing is TOTAL DAILY DOSE and divided doses are stated, compute per-dose = total_daily / divided_doses.
 - If divided doses exist but interval is not given, derive interval_hours = 24 / divided_doses.
+- Show the reference in a short message in patient_specific_notes from where you reasoning for dose exists.
 
 OUTPUT JSON ONLY:
 
@@ -213,7 +228,7 @@ ${JSON.stringify(extractedJson)}
   const status =
     parsed?.status === "OK"
       ? "OK"
-      : parsed?.status === "WARN" 
+      : parsed?.status === "WARN"
         ? "WARN"
         : "WARN";
 
@@ -237,6 +252,8 @@ ${JSON.stringify(extractedJson)}
       typeof parsed?.patient_specific_notes === "string"
         ? parsed.patient_specific_notes
         : null,
+    ai_summary:
+      typeof parsed?.ai_summary === "string" ? parsed.ai_summary : null, 
   };
 }
 
@@ -248,7 +265,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
     if (!isUsableExtractedJson(body.extracted_json)) {
       return json(200, {
         status: "WARN",
-        message: "Monograph incomplete. Using fallback logic.",
+        message: "Monograph incomplete.",
         suggested_next_dose_mg: null,
         interval_hours: null,
         next_eligible_time: null,
@@ -291,7 +308,8 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       calc.interval_hours !== null &&
       calc.interval_hours > 0
     ) {
-      const estimatedDaily = calc.suggested_next_dose_mg * (24 / calc.interval_hours);
+      const estimatedDaily =
+        calc.suggested_next_dose_mg * (24 / calc.interval_hours);
       if (estimatedDaily > maxDailyMg) {
         return json(200, {
           status: "WARN",
@@ -323,7 +341,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       interval_hours: calc.interval_hours,
       next_eligible_time: nextEligible,
       patient_specific_notes: finalPatientNotes,
-      ai_summary: "Dose computed from monograph cache.",
+      ai_summary: calc.ai_summary ?? "Dose computed from monograph data.",
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "AI dose calculation failed";

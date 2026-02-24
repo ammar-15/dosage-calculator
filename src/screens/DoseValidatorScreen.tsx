@@ -398,10 +398,20 @@ export default function DoseValidatorScreen() {
     setAiLoading(false);
 
     if (invokeError) {
-      setSnack({
-        visible: true,
-        text: `AI function error: ${invokeError.message}`,
-      });
+      // @ts-ignore
+      const r: Response | undefined = invokeError.context;
+
+      if (r && typeof r.json === "function") {
+        const errJson = await r.json().catch(() => null);
+        console.log("dose_ai error json:", errJson);
+        setSnack({
+          visible: true,
+          text: errJson?.message ?? invokeError.message,
+        });
+      } else {
+        console.log("dose_ai error:", invokeError);
+        setSnack({ visible: true, text: invokeError.message });
+      }
       return;
     }
     const ruleResult: GuardrailsResult = {

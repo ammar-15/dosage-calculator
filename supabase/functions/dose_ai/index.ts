@@ -590,10 +590,9 @@ export async function doseAiHandler(
   } catch (e) {
     console.error("dose_ai crash:", e);
     return json(500, {
-      status: "WARN",
-      code: "DOSE_AI_CRASH",
+      status: "ERROR",
       message: e instanceof Error ? e.message : String(e),
-      stack: e instanceof Error ? e.stack : null,
+      where: "dose_ai",
     });
   }
 }

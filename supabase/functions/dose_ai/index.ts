@@ -99,10 +99,28 @@ function plausibilityGate(body: DoseReq): PlausibilityGate {
 
 function isUsableExtractedJson(v: any): boolean {
   if (!v || typeof v !== "object") return false;
-  const hasRules = Array.isArray(v.rules) && v.rules.length > 0;
-  const hasTables = Array.isArray(v.tables) && v.tables.length > 0;
-  const hasSections = Array.isArray(v.sections) && v.sections.length > 0;
-  return hasRules || hasTables || hasSections;
+
+  const hasOld =
+    (Array.isArray(v.rules) && v.rules.length > 0) ||
+    (Array.isArray(v.tables) && v.tables.length > 0) ||
+    (Array.isArray(v.sections) && v.sections.length > 0);
+
+  const hasDosing =
+    !!v.dosing &&
+    typeof v.dosing === "object" &&
+    ((Array.isArray(v.dosing?.intravenous) &&
+      v.dosing.intravenous.length > 0) ||
+      (Array.isArray(v.dosing?.oral) && v.dosing.oral.length > 0) ||
+      (Array.isArray(v.dosing?.other_routes) &&
+        v.dosing.other_routes.length > 0));
+
+  const hasSafety =
+    (Array.isArray(v.max_dose_limits) && v.max_dose_limits.length > 0) ||
+    (Array.isArray(v.contraindications) && v.contraindications.length > 0) ||
+    (v.renal_adjustment && typeof v.renal_adjustment === "object") ||
+    (v.hepatic_adjustment && typeof v.hepatic_adjustment === "object");
+
+  return hasOld || hasDosing || hasSafety;
 }
 
 function parseJsonFromContent(content: string): any {
@@ -120,29 +138,53 @@ function parseJsonFromContent(content: string): any {
 }
 
 function extractMaxDailyMg(extractedJson: unknown): number | null {
-  const rules = (extractedJson as any)?.rules;
-  if (!Array.isArray(rules)) return null;
-
+  const j: any = extractedJson;
   const candidates: number[] = [];
-  for (const rule of rules) {
-    const txt = String(rule?.then?.notes ?? "").toLowerCase();
-    if (!txt) continue;
-    if (!txt.includes("day") && !txt.includes("daily")) continue;
 
-    const gMatches = txt.matchAll(
-      /(\d+(?:\.\d+)?)\s*g(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g,
-    );
-    for (const m of gMatches) {
-      const n = Number(m[1]);
-      if (Number.isFinite(n)) candidates.push(n * 1000);
+  // 1) New schema: max_dose_limits
+  if (Array.isArray(j?.max_dose_limits)) {
+    for (const lim of j.max_dose_limits) {
+      const unit = String(lim?.unit ?? "").toLowerCase();
+      const n = Number(lim?.numeric_value);
+      if (!Number.isFinite(n)) continue;
+      if (unit === "g") candidates.push(n * 1000);
+      if (unit === "mg") candidates.push(n);
     }
+  }
 
-    const mgMatches = txt.matchAll(
-      /(\d+(?:\.\d+)?)\s*mg(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g,
-    );
-    for (const m of mgMatches) {
-      const n = Number(m[1]);
-      if (Number.isFinite(n)) candidates.push(n);
+  // 2) New schema: dosing.*.max_daily_dose like "2 g"
+  const dosingLists = [
+    ...(j?.dosing?.oral ?? []),
+    ...(j?.dosing?.intravenous ?? []),
+    ...(j?.dosing?.other_routes ?? []),
+  ];
+  for (const row of dosingLists) {
+    const txt = String(row?.max_daily_dose ?? "").toLowerCase();
+    if (!txt) continue;
+    const g = txt.match(/(\d+(?:\.\d+)?)\s*g/);
+    const mg = txt.match(/(\d+(?:\.\d+)?)\s*mg/);
+    if (g) candidates.push(Number(g[1]) * 1000);
+    if (mg) candidates.push(Number(mg[1]));
+  }
+
+  // 3) Old schema fallback: rules.then.notes
+  const rules = j?.rules;
+  if (Array.isArray(rules)) {
+    for (const rule of rules) {
+      const txt = String(rule?.then?.notes ?? "").toLowerCase();
+      if (!txt) continue;
+      if (!txt.includes("day") && !txt.includes("daily")) continue;
+
+      for (const m of txt.matchAll(
+        /(\d+(?:\.\d+)?)\s*g(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g,
+      )) {
+        candidates.push(Number(m[1]) * 1000);
+      }
+      for (const m of txt.matchAll(
+        /(\d+(?:\.\d+)?)\s*mg(?:\s*\/\s*day|\s*per\s*day|\s*daily)?/g,
+      )) {
+        candidates.push(Number(m[1]));
+      }
     }
   }
 
@@ -155,77 +197,41 @@ async function computeFromMonograph(
   extractedJson: unknown,
 ): Promise<DoseResp> {
   const prompt = `
-You are given structured extracted_json from a Canadian Product Monograph.
+You are given extracted_json from a Canadian Product Monograph (already structured).
 
-Your goal is to compute the next dose safely and accurately using ONLY information found in extracted_json.
-Do NOT invent numbers.
+Goal: compute next dose (mg), interval (hours), and next eligible time using ONLY extracted_json.
+Do NOT invent numbers. If required info is missing, return WARN.
 
------------------------------------
-CLINICAL MATCHING LOGIC
------------------------------------
+How to use extracted_json (priority):
+1) dosing (most important):
+   - dosing.intravenous[]
+   - dosing.oral[]
+   - dosing.other_routes[]
+2) max_dose_limits (caps like "should not exceed 2 g/day")
+3) renal_adjustment / hepatic_adjustment / monitoring_requirements
+4) administration_constraints (infusion rate, duration)
+5) contraindications, interactions, adverse reactions (for WARN notes)
 
-1) Determine population from age_years:
-   - Neonate: <1 month
-   - Infant: <1 year
-   - Child: 1–11 years
-   - Adolescent: 12–17 years
-   - Adult: ≥18 years
+Population matching:
+- Determine population from age_years:
+  neonate (<1 month), infant (<1 year), child (1–11), adolescent (12–17), adult (>=18)
+- Prefer dosing rows whose "population" matches.
+- If multiple routes exist, select the route that best matches patient_notes (e.g. "oral", "IV", "intravenous"). If unclear, WARN.
 
-Prefer population_specific_dosing that matches the patient.
-If no population-specific block exists, fall back to general dosing.
+Dose selection:
+- If mg/kg exists, calculate using weight_kg.
+- If multiple adult fixed regimens exist, choose the one with the clearest matching indication/route text; otherwise choose the lower total daily exposure.
+- If any max_dose_limits apply to the matched population, ensure the computed regimen does not exceed it.
+  If it would exceed, return WARN and do not output a dose.
 
-2) Prefer route-specific dosing if route context is clear from extracted_json or patient_notes.
-If route ambiguity exists, return WARN.
+Reasoning output requirement:
+patient_specific_notes must include:
+- matched route + population
+- the exact dosing row text you used (short)
+- any max daily cap applied (short)
+- any renal/hepatic adjustment warning if relevant
 
------------------------------------
-DATA PRIORITY ORDER
------------------------------------
-
-1) population_specific_dosing (most specific)
-2) dosing (route-specific blocks)
-3) structured max_dose_limits
-4) sections/tables text if structured fields insufficient
-
------------------------------------
-DOSE SELECTION RULES
------------------------------------
-
-- If dose is weight-based (mg/kg), calculate using weight_kg.
-- If range is provided (e.g., 125–500 mg), choose the LOWER bound unless clearly directed otherwise.
-- If interval range exists (6–8h), choose the SHORTER interval.
-- If total daily dose with divided doses is given, compute per-dose.
-- If divided doses exist without interval, derive interval_hours = 24 / divided_doses.
-
------------------------------------
-SAFETY CHECKS (REQUIRED)
------------------------------------
-
-- If renal_adjustment exists and patient_notes indicate renal impairment, apply renal modification.
-- If hepatic_adjustment exists and relevant, apply it.
-- If max_dose_limits exist, ensure total daily dose does NOT exceed cap.
-- If computed regimen exceeds cap, return WARN and do NOT output dose.
-- If contraindications clearly apply, return WARN.
-
------------------------------------
-ADMINISTRATION CONSTRAINTS
------------------------------------
-
-- If infusion rate or administration limits are specified, include in patient_specific_notes.
-
------------------------------------
-REASONING REQUIREMENT
------------------------------------
-
-patient_specific_notes MUST include:
-- Population matched
-- Exact short dosing phrase used
-- Any max dose cap referenced
-- Any renal/hepatic adjustment applied
-
------------------------------------
-OUTPUT JSON ONLY
------------------------------------
-
+Return JSON ONLY with this schema:
 {
   "status": "OK"|"WARN",
   "message": string,
@@ -236,9 +242,7 @@ OUTPUT JSON ONLY
   "ai_summary": string
 }
 
------------------------------------
 Patient:
------------------------------------
 weight_kg=${asNumber(body.weight_kg)}
 age_years=${asNumber(body.age_years)}
 gender=${body.gender ?? null}
@@ -246,9 +250,7 @@ last_dose_mg=${asNumber(body.last_dose_mg)}
 last_dose_time=${body.last_dose_time ?? null}
 patient_notes=${body.patient_notes ?? null}
 
------------------------------------
 extracted_json:
------------------------------------
 ${JSON.stringify(extractedJson)}
 `;
 

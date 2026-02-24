@@ -393,7 +393,7 @@ export default function DoseValidatorScreen() {
     }
 
     const ruleResult: GuardrailsResult = {
-      status: (data?.status as GuardrailsResult["status"]) ?? "BLOCK",
+      status: (data?.status as GuardrailsResult["status"]) ?? "WARN",
       message:
         typeof data?.message === "string"
           ? data.message
@@ -441,25 +441,13 @@ export default function DoseValidatorScreen() {
       time_interval_hours: ruleResult.timeIntervalHours,
       next_eligible_at: ruleResult.nextEligibleAt,
       ai_summary: aiSummaryValue,
-      patient_specific_notes: patientSpecificNotesValue,
-      ai_warnings: null,
-      ai_model: null,
+      ai_model: "gpt-4o-mini",
     };
 
-    let { error } = await supabase.from("patient_data").insert(payload);
-    if (
-      error &&
-      typeof error.message === "string" &&
-      error.message.toLowerCase().includes("patient_specific_notes")
-    ) {
-      const { patient_specific_notes: _omit, ...fallbackPayload } = payload;
-      const fallback = await supabase
-        .from("patient_data")
-        .insert(fallbackPayload);
-      error = fallback.error;
-    }
+    const { error } = await supabase.from("patient_data").insert(payload);
 
     if (error) {
+      console.log("insert error:", error);
       setSnack({ visible: true, text: `Supabase error: ${error.message}` });
       return;
     }

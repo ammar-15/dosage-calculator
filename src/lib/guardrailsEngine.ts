@@ -29,7 +29,7 @@ export type EngineInput = {
 };
 
 export type GuardrailsResult = {
-  status: "OK" | "WARN" | "BLOCK" | "STOP";
+  status: "OK" | "WARN" | "STOP";
   message: string;
   suggestedNextDoseMg: number | null;
   timeIntervalHours: number | null;
@@ -109,20 +109,6 @@ export function computeUsingGuardrails(input: EngineInput): GuardrailsResult {
       !(input.notes ?? "").trim()
     ) {
       blockReasons.push("missing_indication");
-    }
-
-    if (blockReasons.length > 0) {
-      return {
-        status: "BLOCK",
-        message: "Missing required fields for calculation.",
-        suggestedNextDoseMg: null,
-        timeIntervalHours: null,
-        nextEligibleAt: null,
-        capsApplied: false,
-        appliedFormulaType: null,
-        blockReasons,
-        ruleVersion: cfg.meta?.rules_version ?? "unknown",
-      };
     }
 
     const weightKg = Number(input.weightKg);

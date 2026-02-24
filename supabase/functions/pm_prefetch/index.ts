@@ -92,86 +92,54 @@ async function quickPdfHeaderCheck(url: string) {
 
 async function openaiExtractPdfToJson(pmUrl: string) {
   const prompt = `
-You are extracting dosing-relevant information from a Canadian Product Monograph (PDF).
-Return STRICT JSON ONLY (no markdown).
+You are given structured monograph JSON extracted from the PDF.
+You MUST use ONLY extracted_json.rules (and their normalized fields).
+If there is no matching DOSING rule with numeric dose + interval, get necessary info about the product as below.
+
+ABSOLUTE:
+- Do NOT invent any dose numbers.
+- Do NOT infer missing intervals.
+- If route is blocked by any ROUTE rule (then.block=true), you must WARN.
+- If contraindication matches (rule_type=CONTRAINDICATION with block=true), you must WARN.
+
+MATCHING:
+- Prefer HIGH confidence rules over MED over LOW.
+- Get infor on indication using rule.if.indication_text or pathogen_text against patient_notes (simple substring match is OK).
+- Get info population using rule.if.population / age ranges if present.
+- Match route if rule.if.route is not null; otherwise treat as general.
+- Get dosing info for special age groups and special cases, all of them.
+
+TOTAL DAILY DOSE HANDLING (STRICT):
+If a matched DOSING rule has then.dose.per_day=true OR then.dose.divided_doses is set,
+treat then.dose.amount as TOTAL DAILY DOSE.
+- If divided_doses is provided, per-dose = total_daily / divided_doses.
+- If divided_doses is missing, return WARN (do not guess number of doses).
 
 Schema:
 {
-  "meta": {
-    "drug_name": string|null,
-    "pm_date": string|null,
-    "extraction_version": "v2_rule_first",
-    "source": "dpd_pm_pdf",
-    "source_pages": number|null
-  },
+  "meta": { "drug_name": "", "pm_date": "", "source_pages": 0 },
   "sections": [
     {
-      "heading_raw": string,
-      "heading_norm": "INDICATIONS"|"CONTRAINDICATIONS"|"WARNINGS"|"DOSING"|"SPECIAL_POPULATIONS"|"ADMINISTRATION"|"INTERACTIONS"|"ADVERSE_REACTIONS"|"OTHER",
-      "text": string,
-      "page_refs": number[]
+      "heading_raw": "",
+      "heading_norm": "DOSING|WARNINGS|CONTRAINDICATIONS|SPECIAL_POPULATIONS|ADMINISTRATION|INDICATIONS|OTHER",
+      "page_refs": [],
+      "paragraphs": ["...", "..."],
+      "highlights": ["short key bullets only"]
     }
   ],
-  "normalization": {
-    "heading_map": [{"from": string, "to": string}],
-    "route_map": [{"from": string, "to": "IV"|"PO"|"IM"|"SC"|"INHALATION"|"TOPICAL"|"OTHER"}],
-    "condition_map": [{"from": string, "to": string}]
-  },
-  "rules": [
+  "tables": [
     {
-      "rule_type": "INDICATION"|"CONTRAINDICATION"|"DOSING"|"ROUTE"|"MONITORING"|"INTERACTION"|"ADVERSE_REACTION",
-      "confidence": "HIGH"|"MED"|"LOW",
-      "if": {
-        "population": string|null,
-        "age_min_years": number|null,
-        "age_max_years": number|null,
-        "weight_min_kg": number|null,
-        "weight_max_kg": number|null,
-        "indication_text": string|null,
-        "pathogen_text": string|null,
-        "condition_text": string|null,
-        "route": "IV"|"PO"|"IM"|"SC"|"INTRATHECAL"|"OTHER"|null,
-        "renal_impairment": "none"|"mild"|"moderate"|"severe"|null,
-        "hepatic_impairment": "none"|"mild"|"moderate"|"severe"|null,
-        "contra_flag": string|null,
-        "interaction_text": string|null
-      },
-      "then": {
-        "allow": boolean|null,
-        "block": boolean|null,
-        "dose": {
-          "amount": number|null,
-          "unit": "mg"|"g"|null,
-          "per_kg": boolean|null,
-          "per_day": boolean|null,
-          "divided_doses": number|null
-        },
-        "frequency": {
-          "interval_hours": number|null,
-          "frequency_text": string|null
-        },
-        "duration": {
-          "amount": number|null,
-          "unit": "days"|"weeks"|null,
-          "text": string|null
-        },
-        "administration": {
-          "infusion_minutes": number|null,
-          "max_rate_mg_per_min": number|null,
-          "dilution_text": string|null
-        },
-        "monitoring": {
-          "required": boolean|null,
-          "items": string[]
-        },
-        "notes": string|null
-      },
-      "source": {
-        "page_refs": number[],
-        "excerpts": string[]
-      }
+      "table_index": 0,
+      "title": "optional",
+      "page_refs": [],
+      "rows": [
+        { "label": "Adults", "value": "125–500 mg", "frequency": "q6–8h", "duration": "7–10 days", "notes": "" }
+      ],
+      "footer_notes": ["..."],
+      "raw_grid": [["..."]]
     }
-  ]
+  ],
+  "rules": []
 }
 Limit sections to at most 10 entries.
 Truncate section.text to max 1200 characters.

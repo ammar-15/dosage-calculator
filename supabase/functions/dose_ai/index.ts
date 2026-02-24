@@ -86,7 +86,11 @@ function plausibilityGate(body: DoseReq): PlausibilityGate {
 }
 
 function isUsableExtractedJson(v: any): boolean {
-  return !!v && Array.isArray(v?.rules) && v.rules.length > 0;
+  if (!v || typeof v !== "object") return false;
+  const hasRules = Array.isArray(v.rules) && v.rules.length > 0;
+  const hasTables = Array.isArray(v.tables) && v.tables.length > 0;
+  const hasSections = Array.isArray(v.sections) && v.sections.length > 0;
+  return hasRules || hasTables || hasSections;
 }
 
 function parseJsonFromContent(content: string): any {
@@ -137,39 +141,36 @@ async function computeFromMonograph(
   extractedJson: unknown,
 ): Promise<DoseResp> {
   const prompt = `
-Hackathon demo. Not medical advice.
+You are given extracted_json from a Product Monograph.
+It includes sections (headings + paragraphs) and may include tables and/or rules.
 
-You are given structured monograph JSON extracted from the PDF.
-You MUST use ONLY extracted_json.rules (and their normalized fields).
-If there is no matching DOSING rule with numeric dose + interval, return BLOCK.
+PRIMARY GOAL:
+Return next dose (mg), interval (hours), and next eligible time based ONLY on info found in extracted_json.
+Do NOT invent numbers.
 
-ABSOLUTE:
-- Do NOT invent any dose numbers.
-- Do NOT infer missing intervals.
-- If route is blocked by any ROUTE rule (then.block=true), you must BLOCK.
-- If contraindication matches (rule_type=CONTRAINDICATION with block=true), you must BLOCK.
+DATA USE ORDER:
+1) If extracted_json.rules contains a matching DOSING rule with numeric dose + interval_hours -> use it. calculate it
+2) Else, calculate dosing from extracted_json.tables (rows + footer_notes).
+3) Else, calculate dosing from extracted_json.sections where heading_norm is DOSING / ADMINISTRATION / SPECIAL_POPULATIONS.
 
-MATCHING:
-- Prefer HIGH confidence rules over MED over LOW.
-- Match indication using rule.if.indication_text or pathogen_text against patient_notes (simple substring match is OK).
-- Match population using rule.if.population / age ranges if present.
-- Match route if rule.if.route is not null; otherwise treat as general.
+STRICT:
+- Only output values that are explicitly stated in extracted_json.
+- If you see a range (e.g., 125–500 mg), choose the LOWER bound unless the text indicates otherwise.
+- If interval is a range (6–8h), choose the SHORTER interval unless text indicates otherwise.
+- If route-specific dosing exists, match route if provided in text; otherwise leave route unspecified.
+- If dosing is TOTAL DAILY DOSE and divided doses are stated, compute per-dose = total_daily / divided_doses.
+- If divided doses exist but interval is not given, derive interval_hours = 24 / divided_doses.
 
-TOTAL DAILY DOSE HANDLING (STRICT):
-If a matched DOSING rule has then.dose.per_day=true OR then.dose.divided_doses is set,
-treat then.dose.amount as TOTAL DAILY DOSE.
-- If divided_doses is provided, per-dose = total_daily / divided_doses.
-- If divided_doses is missing, return WARN and explain why (do not guess number of doses).
-
-Return STRICT JSON only:
+OUTPUT JSON ONLY:
 
 {
-  "status": "OK"|"WARN"|"BLOCK",
+  "status": "OK"|"WARN",
   "message": string,
   "suggested_next_dose_mg": number|null,
   "interval_hours": number|null,
   "next_eligible_time": string|null,
-  "patient_specific_notes": string|null
+  "patient_specific_notes": string|null,
+  "ai_summary": string
 }
 
 Patient:
@@ -212,7 +213,7 @@ ${JSON.stringify(extractedJson)}
   const status =
     parsed?.status === "OK"
       ? "OK"
-      : parsed?.status === "WARN" || parsed?.status === "BLOCK"
+      : parsed?.status === "WARN" 
         ? "WARN"
         : "WARN";
 
@@ -257,6 +258,16 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
     }
 
     const calc = await computeFromMonograph(body, body.extracted_json);
+
+    let nextEligible = calc.next_eligible_time;
+    if (!nextEligible && calc.interval_hours && body.last_dose_time) {
+      const t0 = new Date(body.last_dose_time);
+      if (!Number.isNaN(t0.getTime())) {
+        nextEligible = new Date(
+          t0.getTime() + calc.interval_hours * 60 * 60 * 1000,
+        ).toISOString();
+      }
+    }
 
     if (
       calc.interval_hours !== null &&
@@ -310,7 +321,7 @@ export async function doseAiHandler(req: { json: () => Promise<DoseReq> }) {
       message: finalMessage,
       suggested_next_dose_mg: calc.suggested_next_dose_mg,
       interval_hours: calc.interval_hours,
-      next_eligible_time: calc.next_eligible_time,
+      next_eligible_time: nextEligible,
       patient_specific_notes: finalPatientNotes,
       ai_summary: "Dose computed from monograph cache.",
     });

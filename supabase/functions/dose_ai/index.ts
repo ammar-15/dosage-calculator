@@ -588,15 +588,12 @@ export async function doseAiHandler(
       ai_summary: calc.ai_summary ?? "Dose computed from monograph data.",
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "AI dose calculation failed";
+    console.error("dose_ai crash:", e);
     return json(500, {
       status: "WARN",
-      message: msg,
-      suggested_next_dose_mg: null,
-      interval_hours: null,
-      next_eligible_time: null,
-      patient_specific_notes: null,
-      ai_summary: "AI explanation unavailable.",
+      code: "DOSE_AI_CRASH",
+      message: e instanceof Error ? e.message : String(e),
+      stack: e instanceof Error ? e.stack : null,
     });
   }
 }
@@ -618,12 +615,9 @@ serve(async (req) => {
     console.error("dose_ai error:", e);
     return json(500, {
       status: "WARN",
-      message: e instanceof Error ? e.message : "AI dose calculation failed",
-      suggested_next_dose_mg: null,
-      interval_hours: null,
-      next_eligible_time: null,
-      patient_specific_notes: null,
-      ai_summary: "AI explanation unavailable.",
+      code: "DOSE_AI_CRASH",
+      message: e instanceof Error ? e.message : String(e),
+      stack: e instanceof Error ? e.stack : null,
     });
   }
 });

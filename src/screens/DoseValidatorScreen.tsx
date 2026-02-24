@@ -373,22 +373,27 @@ export default function DoseValidatorScreen() {
       return;
     }
 
-    const { data, error: invokeError } = await supabase.functions.invoke(
-      "dose_ai",
-      {
-        body: {
-          patient_name: values.patientName,
-          weight_kg: values.weightKg ? Number(values.weightKg) : null,
-          age_years: values.ageYears ? Number(values.ageYears) : null,
-          gender: values.gender ?? null,
-          extracted_json: selectedExtractedJson,
-          drug_name: values.drugName ?? "",
-          last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
-          last_dose_time: lastTakenDate?.toISOString() ?? null,
-          patient_notes: values.notes ?? null,
-        },
+    const res = await supabase.functions.invoke("dose_ai", {
+      body: {
+        patient_name: values.patientName,
+        weight_kg: values.weightKg ? Number(values.weightKg) : null,
+        age_years: values.ageYears ? Number(values.ageYears) : null,
+        gender: values.gender ?? null,
+        extracted_json: selectedExtractedJson,
+        drug_name: values.drugName ?? "",
+        last_dose_mg: values.lastDoseMg ? Number(values.lastDoseMg) : null,
+        last_dose_time: lastTakenDate?.toISOString() ?? null,
+        patient_notes: values.notes ?? null,
       },
-    );
+    });
+    const data = res.data;
+    const invokeError = res.error;
+
+    console.log("dose_ai raw:", res);
+    console.log("dose_ai data:", res.data);
+    console.log("dose_ai error:", res.error);
+    // @ts-ignore
+    console.log("dose_ai error context:", res.error?.context);
 
     setAiLoading(false);
 
@@ -399,9 +404,6 @@ export default function DoseValidatorScreen() {
       });
       return;
     }
-    console.log("dose_ai invokeError:", invokeError);
-    console.log("dose_ai data:", data);
-
     const ruleResult: GuardrailsResult = {
       status: (data?.status as GuardrailsResult["status"]) ?? "WARN",
       message:

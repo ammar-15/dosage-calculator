@@ -93,6 +93,17 @@ function formatIsoOrDash(value: string | null): string {
   });
 }
 
+function numOrNull(v: any): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const m = v.replace(/,/g, "").match(/-?\d+(\.\d+)?/);
+    if (!m) return null;
+    const n = Number(m[0]);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 export default function DoseValidatorScreen() {
   const {
     control,
@@ -420,12 +431,8 @@ export default function DoseValidatorScreen() {
         typeof data?.message === "string"
           ? data.message
           : "Calculation failed.",
-      suggestedNextDoseMg:
-        typeof data?.suggested_next_dose_mg === "number"
-          ? data.suggested_next_dose_mg
-          : null,
-      timeIntervalHours:
-        typeof data?.interval_hours === "number" ? data.interval_hours : null,
+      suggestedNextDoseMg: numOrNull(data?.suggested_next_dose_mg),
+      timeIntervalHours: numOrNull(data?.interval_hours),
       nextEligibleAt:
         typeof data?.next_eligible_time === "string"
           ? data.next_eligible_time

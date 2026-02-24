@@ -55,6 +55,17 @@ function asNumber(v: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function numOrNull(v: any): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const m = v.replace(/,/g, "").match(/-?\d+(\.\d+)?/);
+    if (!m) return null;
+    const n = Number(m[0]);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 function plausibilityGate(body: DoseReq): PlausibilityGate {
   const age = asNumber(body.age_years);
   const wt = asNumber(body.weight_kg);
@@ -417,6 +428,7 @@ ${JSON.stringify(extractedJson)}
   if (typeof content !== "string" || !content.trim()) {
     throw new Error("Empty OpenAI response");
   }
+  console.log("dose_ai raw model content:", content);
 
   const parsed = parseJsonFromContent(content);
   const status =
@@ -432,26 +444,18 @@ ${JSON.stringify(extractedJson)}
       typeof parsed?.message === "string"
         ? parsed.message
         : "Unable to compute from monograph.",
-    suggested_next_dose_mg:
-      typeof parsed?.suggested_next_dose_mg === "number"
-        ? parsed.suggested_next_dose_mg
-        : null,
-    interval_hours:
-      typeof parsed?.interval_hours === "number" ? parsed.interval_hours : null,
+    suggested_next_dose_mg: numOrNull(parsed?.suggested_next_dose_mg),
+    interval_hours: numOrNull(parsed?.interval_hours),
     next_eligible_time:
       typeof parsed?.next_eligible_time === "string"
         ? parsed.next_eligible_time
         : null,
-    max_daily_mg:
-      typeof parsed?.max_daily_mg === "number" ? parsed.max_daily_mg : null,
+    max_daily_mg: numOrNull(parsed?.max_daily_mg),
     max_daily_cap_quote:
       typeof parsed?.max_daily_cap_quote === "string"
         ? parsed.max_daily_cap_quote
         : null,
-    max_daily_cap_page:
-      typeof parsed?.max_daily_cap_page === "number"
-        ? parsed.max_daily_cap_page
-        : null,
+    max_daily_cap_page: numOrNull(parsed?.max_daily_cap_page),
     assumptions: Array.isArray(parsed?.assumptions)
       ? parsed.assumptions.map(String)
       : null,

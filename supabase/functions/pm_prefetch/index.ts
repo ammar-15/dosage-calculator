@@ -48,7 +48,10 @@ function sbErr(label: string, error: any): never {
   throw new Error(`${label}: ${error?.message ?? JSON.stringify(error)}`);
 }
 
-async function mustWrite<T>(q: Promise<DbResult<T>>, label: string): Promise<T> {
+async function mustWrite<T>(
+  q: Promise<DbResult<T>>,
+  label: string,
+): Promise<T> {
   const { data, error } = await q;
   if (error) sbErr(label, error);
   if (data == null) throw new Error(`${label}: no row affected`);
@@ -92,57 +95,117 @@ async function quickPdfHeaderCheck(url: string) {
 
 async function openaiExtractPdfToJson(pmUrl: string) {
   const prompt = `
-You are given structured monograph JSON extracted from the PDF.
-You MUST use ONLY extracted_json.rules (and their normalized fields).
-If there is no matching DOSING rule with numeric dose + interval, get necessary info about the product as below.
+You are extracting structured clinical data from a Canadian Product Monograph PDF.
 
-ABSOLUTE:
-- Do NOT invent any dose numbers.
-- Do NOT infer missing intervals.
-- If route is blocked by any ROUTE rule (then.block=true), you must WARN.
-- If contraindication matches (rule_type=CONTRAINDICATION with block=true), you must WARN.
+Your goal is to capture ALL clinically relevant structured data needed for:
 
-MATCHING:
-- Prefer HIGH confidence rules over MED over LOW.
-- Get infor on indication using rule.if.indication_text or pathogen_text against patient_notes (simple substring match is OK).
-- Get info population using rule.if.population / age ranges if present.
-- Match route if rule.if.route is not null; otherwise treat as general.
-- Get dosing info for special age groups and special cases, all of them.
+- Dose calculation
+- Population-specific dosing
+- Renal/hepatic adjustment
+- Contraindications
+- Maximum dose limits
+- Monitoring requirements
+- Adverse reactions
+- Drug interactions
+- Administration constraints
 
-TOTAL DAILY DOSE HANDLING (STRICT):
-If a matched DOSING rule has then.dose.per_day=true OR then.dose.divided_doses is set,
-treat then.dose.amount as TOTAL DAILY DOSE.
-- If divided_doses is provided, per-dose = total_daily / divided_doses.
-- If divided_doses is missing, return WARN (do not guess number of doses).
+STRICT RULES:
+- Do NOT invent information.
+- Only extract what is explicitly stated in the PDF.
+- Preserve numeric values exactly as written.
+- Preserve units exactly as written (mg, mg/kg, g/day, mL/min, etc.).
+- Capture max dose caps exactly as written (e.g., "should not exceed 2 g per day").
+- Capture renal/hepatic exceptions even if embedded inside dosing paragraphs.
+- Capture infusion rate restrictions (e.g., "no more than 10 mg/min").
+
+PRIORITY:
+Dosing and safety exceptions are highest priority.
+
+OUTPUT JSON ONLY.
 
 Schema:
+
 {
-  "meta": { "drug_name": "", "pm_date": "", "source_pages": 0 },
-  "sections": [
+  "meta": {
+    "drug_name": "",
+    "pm_date": "",
+    "source_pages": 0
+  },
+
+  "dosing": {
+    "intravenous": [],
+    "oral": [],
+    "other_routes": []
+  },
+
+  "population_specific_dosing": {
+    "adults": [],
+    "children": [],
+    "infants": [],
+    "neonates": [],
+    "geriatrics": []
+  },
+
+  "renal_adjustment": {
+    "dose_adjustments": [],
+    "monitoring_requirements": [],
+    "warnings": []
+  },
+
+  "hepatic_adjustment": {
+    "dose_adjustments": [],
+    "warnings": []
+  },
+
+  "max_dose_limits": [
     {
-      "heading_raw": "",
-      "heading_norm": "DOSING|WARNINGS|CONTRAINDICATIONS|SPECIAL_POPULATIONS|ADMINISTRATION|INDICATIONS|OTHER",
-      "page_refs": [],
-      "paragraphs": ["...", "..."],
-      "highlights": ["short key bullets only"]
+      "population": "",
+      "limit_text": "",
+      "numeric_value": "",
+      "unit": ""
     }
   ],
-  "tables": [
+
+  "contraindications": [],
+
+  "boxed_warnings": [],
+
+  "monitoring_requirements": [],
+
+  "administration_constraints": [
     {
-      "table_index": 0,
-      "title": "optional",
-      "page_refs": [],
-      "rows": [
-        { "label": "Adults", "value": "125–500 mg", "frequency": "q6–8h", "duration": "7–10 days", "notes": "" }
-      ],
-      "footer_notes": ["..."],
-      "raw_grid": [["..."]]
+      "type": "infusion_rate|dilution|duration|other",
+      "text": ""
     }
   ],
-  "rules": []
+
+  "adverse_reactions": {
+    "common": [],
+    "serious": []
+  },
+
+  "drug_interactions": [],
+
+  "special_populations_notes": [],
+
+  "sections_summary": [
+    {
+      "heading": "",
+      "short_summary": ""
+    }
+  ]
 }
-Limit sections to at most 10 entries.
-Truncate section.text to max 1200 characters.
+
+INSTRUCTIONS:
+- Extract dosing tables as structured entries in dosing arrays.
+- Extract mg/kg and per-day expressions exactly.
+- Extract frequency exactly (e.g., q6h, every 12 hours).
+- Extract divided dose instructions exactly.
+- If text states "total daily dose should not exceed X", add to max_dose_limits.
+- If renal impairment section exists, extract dose modification rules.
+- If therapeutic drug monitoring is mentioned (e.g., trough levels), include it.
+- Extract only clinically relevant content. Do not include marketing or non-clinical text.
+
 Return JSON only.
 `;
 
@@ -172,7 +235,10 @@ Return JSON only.
             role: "user",
             content: [
               { type: "input_file", file_url: pmUrl },
-              { type: "input_text", text: "Extract dosing-relevant JSON from this PDF." },
+              {
+                type: "input_text",
+                text: "Extract dosing-relevant JSON from this PDF.",
+              },
             ],
           },
         ],
@@ -200,7 +266,8 @@ Return JSON only.
           const parts: string[] = [];
           for (const item of data?.output ?? []) {
             for (const c of item?.content ?? []) {
-              if (typeof c?.text === "string" && c.text.trim()) parts.push(c.text);
+              if (typeof c?.text === "string" && c.text.trim())
+                parts.push(c.text);
             }
           }
           return parts.join("\n").trim();
@@ -221,7 +288,9 @@ Return JSON only.
   return parsed;
 }
 
-export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> }) {
+export async function pmPrefetchHandler(req: {
+  json: () => Promise<PrefetchReq>;
+}) {
   try {
     const body = (await req.json().catch(() => ({}))) as PrefetchReq;
     const drugCode = String(body.drug_code ?? "").trim();
@@ -254,17 +323,15 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
 
       if (!srcRow) {
         await mustOk(
-          sb
-            .from("dpd_pm_cache")
-            .upsert(
-              {
-                drug_code: drugCode,
-                cache_status: "NO_PDF" as CacheStatus,
-                cache_error: "drug_code not found in dpd_drug_product_all",
-                updated_at: new Date().toISOString(),
-              },
-              { onConflict: "drug_code" },
-            ),
+          sb.from("dpd_pm_cache").upsert(
+            {
+              drug_code: drugCode,
+              cache_status: "NO_PDF" as CacheStatus,
+              cache_error: "drug_code not found in dpd_drug_product_all",
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "drug_code" },
+          ),
           "SET NO_PDF source missing",
         );
 
@@ -292,20 +359,18 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
         );
       } else {
         await mustOk(
-          sb
-            .from("dpd_pm_cache")
-            .upsert(
-              {
-                drug_code: drugCode,
-                brand_name: srcRow.brand_name ?? null,
-                din: srcRow.din ?? null,
-                pm_pdf_url: srcRow.pm_pdf_url ?? null,
-                pm_date: srcRow.pm_date ?? null,
-                cache_status: "NEW" as CacheStatus,
-                updated_at: new Date().toISOString(),
-              },
-              { onConflict: "drug_code" },
-            ),
+          sb.from("dpd_pm_cache").upsert(
+            {
+              drug_code: drugCode,
+              brand_name: srcRow.brand_name ?? null,
+              din: srcRow.din ?? null,
+              pm_pdf_url: srcRow.pm_pdf_url ?? null,
+              pm_date: srcRow.pm_date ?? null,
+              cache_status: "NEW" as CacheStatus,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "drug_code" },
+          ),
           "UPSERT new cache row",
         );
       }
@@ -313,17 +378,15 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
 
     if (!pmUrl) {
       await mustOk(
-        sb
-          .from("dpd_pm_cache")
-          .upsert(
-            {
-              drug_code: drugCode,
-              cache_status: "NO_PDF" as CacheStatus,
-              cache_error: "No Product Monograph PDF URL for this drug_code",
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: "drug_code" },
-          ),
+        sb.from("dpd_pm_cache").upsert(
+          {
+            drug_code: drugCode,
+            cache_status: "NO_PDF" as CacheStatus,
+            cache_error: "No Product Monograph PDF URL for this drug_code",
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "drug_code" },
+        ),
         "SET NO_PDF",
       );
 
@@ -331,16 +394,14 @@ export async function pmPrefetchHandler(req: { json: () => Promise<PrefetchReq> 
     }
 
     await mustOk(
-      sb
-        .from("dpd_pm_cache")
-        .upsert(
-          {
-            drug_code: drugCode,
-            pm_pdf_url: pmUrl,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "drug_code" },
-        ),
+      sb.from("dpd_pm_cache").upsert(
+        {
+          drug_code: drugCode,
+          pm_pdf_url: pmUrl,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "drug_code" },
+      ),
       "ENSURE cache row exists",
     );
 

@@ -155,28 +155,76 @@ async function computeFromMonograph(
   extractedJson: unknown,
 ): Promise<DoseResp> {
   const prompt = `
-You are given extracted_json from a Product Monograph.
-It includes sections (headings + paragraphs) and may include tables and/or rules.
+You are given structured extracted_json from a Canadian Product Monograph.
 
-PRIMARY GOAL:
-Return next dose (mg), interval (hours), and next eligible time based ONLY on info found in extracted_json.
+Your goal is to compute the next dose safely and accurately using ONLY information found in extracted_json.
 Do NOT invent numbers.
 
-DATA USE ORDER:
-1) If extracted_json.rules contains a matching DOSING rule with numeric dose + interval_hours -> use it. calculate it
-2) Else, calculate dosing from extracted_json.tables (rows + footer_notes).
-3) Else, calculate dosing from extracted_json.sections where heading_norm is DOSING / ADMINISTRATION / SPECIAL_POPULATIONS.
+-----------------------------------
+CLINICAL MATCHING LOGIC
+-----------------------------------
 
-STRICT:
-- Only output values that are explicitly stated in extracted_json.
-- If you see a range (e.g., 125–500 mg), choose the MIDDLE ground to the nearest 25 unless the text indicates otherwise.
-- If interval is a range (6–8h), choose the MIDDLE interval unless text indicates otherwise.
-- If route-specific dosing exists, match route if provided in text; otherwise leave route unspecified.
-- If dosing is TOTAL DAILY DOSE and divided doses are stated, compute per-dose = total_daily / divided_doses.
-- If divided doses exist but interval is not given, derive interval_hours = 24 / divided_doses.
-- Show the reference in a short message in patient_specific_notes from where you reasoning for dose exists.
+1) Determine population from age_years:
+   - Neonate: <1 month
+   - Infant: <1 year
+   - Child: 1–11 years
+   - Adolescent: 12–17 years
+   - Adult: ≥18 years
 
-OUTPUT JSON ONLY:
+Prefer population_specific_dosing that matches the patient.
+If no population-specific block exists, fall back to general dosing.
+
+2) Prefer route-specific dosing if route context is clear from extracted_json or patient_notes.
+If route ambiguity exists, return WARN.
+
+-----------------------------------
+DATA PRIORITY ORDER
+-----------------------------------
+
+1) population_specific_dosing (most specific)
+2) dosing (route-specific blocks)
+3) structured max_dose_limits
+4) sections/tables text if structured fields insufficient
+
+-----------------------------------
+DOSE SELECTION RULES
+-----------------------------------
+
+- If dose is weight-based (mg/kg), calculate using weight_kg.
+- If range is provided (e.g., 125–500 mg), choose the LOWER bound unless clearly directed otherwise.
+- If interval range exists (6–8h), choose the SHORTER interval.
+- If total daily dose with divided doses is given, compute per-dose.
+- If divided doses exist without interval, derive interval_hours = 24 / divided_doses.
+
+-----------------------------------
+SAFETY CHECKS (REQUIRED)
+-----------------------------------
+
+- If renal_adjustment exists and patient_notes indicate renal impairment, apply renal modification.
+- If hepatic_adjustment exists and relevant, apply it.
+- If max_dose_limits exist, ensure total daily dose does NOT exceed cap.
+- If computed regimen exceeds cap, return WARN and do NOT output dose.
+- If contraindications clearly apply, return WARN.
+
+-----------------------------------
+ADMINISTRATION CONSTRAINTS
+-----------------------------------
+
+- If infusion rate or administration limits are specified, include in patient_specific_notes.
+
+-----------------------------------
+REASONING REQUIREMENT
+-----------------------------------
+
+patient_specific_notes MUST include:
+- Population matched
+- Exact short dosing phrase used
+- Any max dose cap referenced
+- Any renal/hepatic adjustment applied
+
+-----------------------------------
+OUTPUT JSON ONLY
+-----------------------------------
 
 {
   "status": "OK"|"WARN",
@@ -188,7 +236,9 @@ OUTPUT JSON ONLY:
   "ai_summary": string
 }
 
+-----------------------------------
 Patient:
+-----------------------------------
 weight_kg=${asNumber(body.weight_kg)}
 age_years=${asNumber(body.age_years)}
 gender=${body.gender ?? null}
@@ -196,7 +246,9 @@ last_dose_mg=${asNumber(body.last_dose_mg)}
 last_dose_time=${body.last_dose_time ?? null}
 patient_notes=${body.patient_notes ?? null}
 
+-----------------------------------
 extracted_json:
+-----------------------------------
 ${JSON.stringify(extractedJson)}
 `;
 
@@ -253,7 +305,7 @@ ${JSON.stringify(extractedJson)}
         ? parsed.patient_specific_notes
         : null,
     ai_summary:
-      typeof parsed?.ai_summary === "string" ? parsed.ai_summary : null, 
+      typeof parsed?.ai_summary === "string" ? parsed.ai_summary : null,
   };
 }
 

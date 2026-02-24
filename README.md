@@ -23,7 +23,7 @@ This is a demo project for technical and educational purposes. It is not clinica
 
 ## Why I built this
 
-This project has been built in collaboration with my wife, Syeda Arfaa, who is a medical doctor.
+This project has been built in collaboration with my wife, [Syeda Arfaa](https://www.linkedin.com/in/syeda-arfaa-863bbb266/), who is a Doctor of Pharmacy Intern.
 
 In daily hospital practice, doctors must manually review Health Canada Product Monographs (PMs) and hospital/clinical dosing guidelines to determine patient-specific dosages.
 

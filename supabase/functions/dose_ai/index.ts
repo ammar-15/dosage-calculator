@@ -157,13 +157,43 @@ function parseJsonFromContent(content: string): any {
     .replace(/```json\s*/gi, "")
     .replace(/```\s*/g, "")
     .trim();
-  const firstBrace = stripped.indexOf("{");
-  const lastBrace = stripped.lastIndexOf("}");
-  const sliced =
-    firstBrace >= 0 && lastBrace >= 0
-      ? stripped.slice(firstBrace, lastBrace + 1)
-      : stripped;
-  return JSON.parse(sliced);
+
+  // take the first JSON object only (in case model outputs extra text)
+  const start = stripped.indexOf("{");
+  if (start < 0) throw new Error("Model did not return JSON object");
+
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let end = -1;
+
+  for (let i = start; i < stripped.length; i++) {
+    const ch = stripped[i];
+
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    } else {
+      if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+  }
+
+  const sliced = end >= 0 ? stripped.slice(start, end + 1) : stripped.slice(start);
+
+  // remove trailing commas before } or ]
+  const cleaned = sliced.replace(/,\s*([}\]])/g, "$1");
+
+  return JSON.parse(cleaned);
 }
 
 function extractMaxDailyMg(extractedJson: unknown): number | null {
@@ -430,7 +460,29 @@ ${JSON.stringify(extractedJson)}
   }
   console.log("dose_ai raw model content:", content);
 
-  const parsed = parseJsonFromContent(content);
+  let parsed: any;
+  try {
+    parsed = parseJsonFromContent(content);
+  } catch (e) {
+    console.log("dose_ai: parse failed, retrying once. raw:", content);
+    // retry once (models often output valid JSON on the next call)
+    const resp2 = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-nano",
+        temperature: 0.1,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const data2 = await resp2.json();
+    const content2 = data2?.choices?.[0]?.message?.content ?? "";
+    console.log("dose_ai raw model content (retry):", content2);
+    parsed = parseJsonFromContent(String(content2));
+  }
   const status =
     parsed?.status === "OK"
       ? "OK"

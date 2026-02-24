@@ -38,6 +38,105 @@ function json(status: number, body: unknown) {
   });
 }
 
+async function rateLimitOrThrow(
+  sb: any,
+  key: string,
+  limit = 5,
+  windowSec = 1,
+) {
+  const now = new Date();
+  const windowStart = new Date(
+    Math.floor(now.getTime() / (windowSec * 1000)) * windowSec * 1000,
+  ).toISOString();
+
+  // Try insert (first request in window)
+  const ins = await sb
+    .from("rate_limits")
+    .insert({
+      key,
+      window_start: windowStart,
+      count: 1,
+      updated_at: now.toISOString(),
+    })
+    .select("count, window_start")
+    .maybeSingle();
+
+  // Insert worked → ok
+  if (!ins.error) return;
+
+  // Row exists → update if same window, else reset
+  const { data: existing, error: selErr } = await sb
+    .from("rate_limits")
+    .select("count, window_start")
+    .eq("key", key)
+    .maybeSingle();
+
+  if (selErr || !existing) throw new Error("RATE_LIMIT_DB_ERROR");
+
+  const sameWindow = new Date(existing.window_start).toISOString() === windowStart;
+
+  if (!sameWindow) {
+    // reset window
+    const { error: updErr } = await sb
+      .from("rate_limits")
+      .update({
+        window_start: windowStart,
+        count: 1,
+        updated_at: now.toISOString(),
+      })
+      .eq("key", key);
+
+    if (updErr) throw new Error("RATE_LIMIT_DB_ERROR");
+    return;
+  }
+
+  if (existing.count >= limit) {
+    const err: any = new Error("RATE_LIMITED");
+    err.status = 429;
+    err.retry_after = windowSec;
+    throw err;
+  }
+
+  // increment count
+  const { error: incErr } = await sb
+    .from("rate_limits")
+    .update({ count: existing.count + 1, updated_at: now.toISOString() })
+    .eq("key", key);
+
+  if (incErr) throw new Error("RATE_LIMIT_DB_ERROR");
+}
+
+function getIp(req: Request): string {
+  return (
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    req.headers.get("cf-connecting-ip") ||
+    "unknown"
+  );
+}
+
+function decodeJwtPayload(token: string): any | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const raw = atob(padded);
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function getUserKeyFromAuth(req: Request): string | null {
+  const auth = req.headers.get("authorization") || req.headers.get("Authorization");
+  if (!auth) return null;
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  const payload = decodeJwtPayload(m[1]);
+  const sub = typeof payload?.sub === "string" ? payload.sub.trim() : "";
+  return sub ? `user:${sub}` : null;
+}
+
 function sbErr(label: string, error: any): never {
   throw new Error(`${label}: ${error?.message ?? JSON.stringify(error)}`);
 }
@@ -317,7 +416,12 @@ Return JSON ONLY.
 `.trim();
 }
 
-async function openaiExtractPdfToJson(pmUrl: string, OPENAI_API_KEY: string) {
+async function openaiExtractPdfToJson(
+  pmUrl: string,
+  OPENAI_API_KEY: string,
+  sb: any,
+  key: string,
+) {
   const basePrompt = `
 You are extracting dosing-critical information from a Canadian Product Monograph PDF.
 
@@ -361,6 +465,7 @@ Schema:
     const ctrl = new AbortController();
     const timeoutId = setTimeout(() => ctrl.abort(), 90_000); // more breathing room
     try {
+      await rateLimitOrThrow(sb, `openai:${key}`, 2, 1);
       const resp = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         signal: ctrl.signal,
@@ -469,7 +574,7 @@ ${badJsonText}
 
 export async function pmPrefetchHandler(req: {
   json: () => Promise<PrefetchReq>;
-}) {
+}, key: string) {
   try {
     const PROJECT_URL = getEnv("PROJECT_URL");
     const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
@@ -639,7 +744,12 @@ export async function pmPrefetchHandler(req: {
     );
 
     try {
-      const extracted = await openaiExtractPdfToJson(pmUrl, OPENAI_API_KEY);
+      const extracted = await openaiExtractPdfToJson(
+        pmUrl,
+        OPENAI_API_KEY,
+        sb,
+        key,
+      );
 
       await mustWrite(
         sb
@@ -695,5 +805,27 @@ serve((req) => {
       headers: { ...corsHeaders, "Content-Type": "text/plain" },
     });
   }
-  return pmPrefetchHandler({ json: () => req.json() });
+  return (async () => {
+    try {
+      const PROJECT_URL = getEnv("PROJECT_URL");
+      const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
+      const sb = createClient(PROJECT_URL, SERVICE_KEY);
+      const key = getUserKeyFromAuth(req) ?? `ip:${getIp(req)}`;
+
+      // 5 requests per second max per key
+      await rateLimitOrThrow(sb, `pm_prefetch:${key}`, 5, 1);
+
+      return await pmPrefetchHandler({ json: () => req.json() }, key);
+    } catch (e) {
+      if ((e as any)?.status === 429) {
+        return json(429, {
+          status: "ERROR",
+          message: "Too many requests. Please slow down.",
+          retry_after_seconds: (e as any)?.retry_after ?? 1,
+        });
+      }
+      const msg = e instanceof Error ? e.message : "unknown error";
+      return json(500, { status: "ERROR", message: msg });
+    }
+  })();
 });

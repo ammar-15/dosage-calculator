@@ -1,4 +1,5 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "npm:@supabase/supabase-js@2";
 
 type DoseReq = {
   extracted_json?: unknown;
@@ -48,6 +49,105 @@ function json(status: number, body: unknown) {
     status,
     headers: { "Content-Type": "application/json", ...corsHeaders },
   });
+}
+
+async function rateLimitOrThrow(
+  sb: any,
+  key: string,
+  limit = 5,
+  windowSec = 1,
+) {
+  const now = new Date();
+  const windowStart = new Date(
+    Math.floor(now.getTime() / (windowSec * 1000)) * windowSec * 1000,
+  ).toISOString();
+
+  // Try insert (first request in window)
+  const ins = await sb
+    .from("rate_limits")
+    .insert({
+      key,
+      window_start: windowStart,
+      count: 1,
+      updated_at: now.toISOString(),
+    })
+    .select("count, window_start")
+    .maybeSingle();
+
+  // Insert worked → ok
+  if (!ins.error) return;
+
+  // Row exists → update if same window, else reset
+  const { data: existing, error: selErr } = await sb
+    .from("rate_limits")
+    .select("count, window_start")
+    .eq("key", key)
+    .maybeSingle();
+
+  if (selErr || !existing) throw new Error("RATE_LIMIT_DB_ERROR");
+
+  const sameWindow = new Date(existing.window_start).toISOString() === windowStart;
+
+  if (!sameWindow) {
+    // reset window
+    const { error: updErr } = await sb
+      .from("rate_limits")
+      .update({
+        window_start: windowStart,
+        count: 1,
+        updated_at: now.toISOString(),
+      })
+      .eq("key", key);
+
+    if (updErr) throw new Error("RATE_LIMIT_DB_ERROR");
+    return;
+  }
+
+  if (existing.count >= limit) {
+    const err: any = new Error("RATE_LIMITED");
+    err.status = 429;
+    err.retry_after = windowSec;
+    throw err;
+  }
+
+  // increment count
+  const { error: incErr } = await sb
+    .from("rate_limits")
+    .update({ count: existing.count + 1, updated_at: now.toISOString() })
+    .eq("key", key);
+
+  if (incErr) throw new Error("RATE_LIMIT_DB_ERROR");
+}
+
+function getIp(req: Request): string {
+  return (
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    req.headers.get("cf-connecting-ip") ||
+    "unknown"
+  );
+}
+
+function decodeJwtPayload(token: string): any | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const raw = atob(padded);
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function getUserKeyFromAuth(req: Request): string | null {
+  const auth = req.headers.get("authorization") || req.headers.get("Authorization");
+  if (!auth) return null;
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  const payload = decodeJwtPayload(m[1]);
+  const sub = typeof payload?.sub === "string" ? payload.sub.trim() : "";
+  return sub ? `user:${sub}` : null;
 }
 
 function asNumber(v: unknown): number | null {
@@ -272,6 +372,8 @@ async function computeFromMonograph(
   body: DoseReq,
   extractedJson: unknown,
   OPENAI_API_KEY: string,
+  sb: any,
+  key: string,
 ): Promise<DoseResp> {
   const prompt = `
 You are given extracted_json from a Canadian Product Monograph (already structured).
@@ -435,6 +537,7 @@ extracted_json:
 ${JSON.stringify(extractedJson)}
 `;
 
+  await rateLimitOrThrow(sb, `openai:${key}`, 2, 1);
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -466,6 +569,7 @@ ${JSON.stringify(extractedJson)}
   } catch (e) {
     console.log("dose_ai: parse failed, retrying once. raw:", content);
     // retry once (models often output valid JSON on the next call)
+    await rateLimitOrThrow(sb, `openai:${key}`, 2, 1);
     const resp2 = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -523,6 +627,8 @@ ${JSON.stringify(extractedJson)}
 export async function doseAiHandler(
   req: { json: () => Promise<DoseReq> },
   OPENAI_API_KEY: string,
+  sb: any,
+  key: string,
 ) {
   try {
     const body = await req.json();
@@ -544,6 +650,8 @@ export async function doseAiHandler(
       body,
       body.extracted_json,
       OPENAI_API_KEY,
+      sb,
+      key,
     );
 
     let nextEligible = calc.next_eligible_time;
@@ -661,12 +769,29 @@ serve(async (req) => {
   }
 
   try {
+    const PROJECT_URL = getEnv("PROJECT_URL");
+    const SERVICE_KEY = getEnv("SERVICE_ROLE_KEY");
     const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
+    const sb = createClient(PROJECT_URL, SERVICE_KEY);
+    const key = getUserKeyFromAuth(req) ?? `ip:${getIp(req)}`;
+
+    // 5 requests per second max per key
+    await rateLimitOrThrow(sb, `dose_ai:${key}`, 5, 1);
+
     return await doseAiHandler(
       { json: () => req.json() },
       OPENAI_API_KEY,
+      sb,
+      key,
     );
   } catch (e) {
+    if ((e as any)?.status === 429) {
+      return json(429, {
+        status: "ERROR",
+        message: "Too many requests. Please slow down.",
+        retry_after_seconds: (e as any)?.retry_after ?? 1,
+      });
+    }
     console.error("dose_ai error:", e);
     return json(500, {
       status: "WARN",
